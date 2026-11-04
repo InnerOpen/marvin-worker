@@ -94,7 +94,7 @@ Tested on Podman 4.6 (rootless): a started container, its exit code and output r
 ## Kubernetes and OpenShift
 
 OpenShift takes the same manifests: use `oc` where this says `kubectl` (`oc create secret generic marvin-worker --from-literal=MARVIN_USER_TOKEN=...`,
-`oc apply -f`). It assigns an arbitrary non-root user id, which the images are built for. Not yet tried on OpenShift or any real cluster.
+`oc apply -f`). It assigns an arbitrary non-root user id, which the images are built for (checked: see the status note at the end).
 
 **A dispatcher that makes a Job per run.** It needs a ServiceAccount that may create Jobs in one namespace, and a Secret holding the token. The
 Job it creates gets Marvin's address and the token from that Secret (never written into the Job), one attempt (`backoffLimit: 0`), a deadline from
@@ -168,10 +168,14 @@ spec:
               valueFrom: {secretKeyRef: {name: marvin-worker, key: MARVIN_USER_TOKEN}}
 ```
 
-The images run as a non-root user and write nothing but `/tmp`, so they are built to work where the user id is assigned (OpenShift); not yet tried there.
+The images run as a non-root user and write nothing but `/tmp`, so they are built to work where the user id is assigned (OpenShift). Checked on OpenShift 4 under `restricted-v2`: the pod ran as user 1000820000, group 0, with `/tmp` writable and nothing else.
 
-Status of these manifests: written from the code, **not yet run on a cluster**. The Job command was wrong until this guide was written (it set only `args`, which
-replaced the image's `CMD`); that is fixed and unit-tested. Run one real job through it before relying on it.
+Status of these manifests: **run on OpenShift 4** (a dispatcher Deployment with its Role and a Secret, in a fresh project, the images from the cluster's own registry). One
+`kubernetes`-mode job went queued, claimed, done in about 15 seconds: the dispatcher made a Job (`command` correct, one attempt, a deadline from the kind's time allowed, clean-up
+after ten minutes), the pod ran under `restricted-v2` as an arbitrary user id, and the result and the dispatching pod's name came back on the job record. The test also found that a
+dispatcher in a pod, which has no Docker, failed before claiming anything whenever the workspace had a `docker`-mode kind; a dispatcher now takes only the modes it can start (local,
+http, docker with the container CLI, kubernetes with the in-cluster token). Not covered: a runner as a Deployment, the standing HTTP worker, other Kubernetes distributions, and the
+container output capture, which is for Docker and Podman only (a Job's pod logs are not copied onto the job).
 
 ## Checking it works
 
