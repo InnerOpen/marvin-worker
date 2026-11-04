@@ -1,0 +1,17 @@
+[project]
+name = "marvin-worker"
+version = "0.1.0"
+description = "A generic job worker for Marvin: takes heavy jobs over HTTP, runs them, writes the outcome back to a Marvin record."
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["marvin_worker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
