@@ -252,6 +252,25 @@ def test_a_container_that_finished_after_reporting_is_only_cleaned_up_not_failed
     assert _data("job-1")["status"] == "done" and "inspect" not in docker.calls and docker.calls[-1] == "rm"
 
 
+def test_what_a_finished_container_printed_is_kept_on_its_job_after_the_jobs_own_log(marvin, monkeypatch):
+    FakeMarvin.rows = [_job("job-1", status="failed", log="JobError: story has no lines")]
+    monkeypatch.setattr(dispatch.subprocess, "run", _Docker([("mw-job-1", "job-1")], code="0", logs="pulling beats\ncutting 27 lines"))
+
+    dispatch.reap_docker(marvin)
+
+    kept = _data("job-1")["log"]
+    assert kept.startswith("JobError: story has no lines") and dispatch.OUTPUT_MARK in kept and kept.endswith("cutting 27 lines")
+
+
+def test_a_job_whose_container_output_is_already_kept_or_empty_is_left_alone(marvin, monkeypatch):
+    FakeMarvin.rows = [_job("job-1", status="done", log=f"ok\n\n{dispatch.OUTPUT_MARK}\nearlier"), _job("job-2", status="done", log="ok")]
+    monkeypatch.setattr(dispatch.subprocess, "run", _Docker([("mw-job-1", "job-1"), ("mw-job-2", "job-2")], code="0", logs=""))
+
+    dispatch.reap_docker(marvin)
+
+    assert _data("job-1")["log"].endswith("earlier") and _data("job-2")["log"] == "ok"
+
+
 def test_the_dispatcher_reaps_for_the_modes_in_use_before_it_starts_anything(marvin):
     FakeMarvin.rows = [_kind(mode="docker")]
     reaped = []

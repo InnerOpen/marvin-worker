@@ -130,13 +130,23 @@ def start_kubernetes(job: dict, kind: dict, creds: marvin_api.Creds, *, api: str
         raise LaunchError(f"can't reach Kubernetes: {e}") from e
 
 
+OUTPUT_MARK = "--- container output ---"
+OUTPUT_LIMIT = 4000  # characters kept per job: enough for a traceback or a run's last lines, not a whole log
+
+
 def reap_docker(creds: marvin_api.Creds) -> int:
-    """Clean up the worker containers that have exited. A job record still `claimed` or `running` when its container is gone
-    never got an outcome (the worker died, or could not start): fail it with the container's last output, so it shows at once and
-    not at the timeout. Returns how many containers it removed. Containers are kept after exit (no --rm) exactly so this can read them."""
+    """Clean up the worker containers that have exited, keeping what each one said. A job still `claimed` or `running` when its container
+    is gone never got an outcome (the worker died, or could not start): fail it with the container's last output, so it shows at once and
+    not at the timeout. A job that did report (done or failed) keeps its own log and gains the container's output after it, so a run's
+    console output is on the record instead of being thrown away with the container. Returns how many containers it removed. Containers
+    are kept after exit (no --rm) exactly so this can read them."""
 
     def docker(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=60)  # noqa: S603
+
+    def said(name: str, lines: int) -> str:
+        out = docker("logs", "--tail", str(lines), name)  # a container's stdout and stderr come back on the two streams
+        return (out.stdout + out.stderr).strip()
 
     listed = docker("ps", "-a", "--filter", "label=marvin-worker=1", "--filter", "status=exited", "--format", '{{.Names}}\t{{.Label "marvin-job"}}')
     if listed.returncode != 0:
@@ -147,11 +157,16 @@ def reap_docker(creds: marvin_api.Creds) -> int:
         if not name:
             continue
         rows = marvin_api.query(creds, {"entries": slug}, limit=1) if slug else []
-        status = ((rows[0].get("dataJson") or {}).get("status") if rows else None)
+        data = (rows[0].get("dataJson") or {}) if rows else {}
+        status = data.get("status")
         if status in ("claimed", "running"):
             code = docker("inspect", "-f", "{{.State.ExitCode}}", name).stdout.strip()
-            tail = (docker("logs", "--tail", "15", name).stdout + docker("logs", "--tail", "15", name).stderr).strip()[-600:]
-            marvin_api.update_entry(creds, slug, {"status": "failed", "log": f"The worker container exited (code {code}) before reporting an outcome.\n{tail}"})
+            marvin_api.update_entry(creds, slug, {"status": "failed", "log": f"The worker container exited (code {code}) before reporting an outcome.\n{said(name, 15)[-600:]}"})
+        elif status in ("done", "failed") and slug and OUTPUT_MARK not in str(data.get("log") or ""):
+            output = said(name, 60)
+            if output:
+                kept = f"{str(data.get('log') or '').strip()}\n\n{OUTPUT_MARK}\n".lstrip("\n") + output[-OUTPUT_LIMIT:]
+                marvin_api.update_entry(creds, slug, {"log": kept})
         docker("rm", name)
         removed += 1
     return removed
