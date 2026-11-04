@@ -31,7 +31,7 @@ nothing has to reach in and Marvin never holds keys to the cluster. A started wo
 
 A job past its kind's time allowed, with no outcome, is failed so a dead worker doesn't hold a place. In docker mode a worker container that dies before reporting fails its job at once, with its last output. Run one dispatcher. It also keeps a `worker` record (its machine, the modes it starts, `last_seen` rewritten about once a minute) that Marvin's **Settings → Workers** page reads to say whether anything is watching the queue.
 
-The record types a workspace needs for this: `job` (kind, args, status, result, log, attempts, claimed_at), `job-kind` (kind, mode, image, url, timeout_seconds, resources, notes) and `worker` (role, host, modes, last_seen, started_at, jobs_started).
+The record types a workspace needs for this: `job` (kind, args, status, result, log, attempts, claimed_at, claimed_by), `job-kind` (kind, mode, image, url, timeout_seconds, resources, notes) and `worker` (role, host, modes, kinds, status, current_job, tags, last_seen, started_at, jobs_started, jobs_done).
 Environment: `MARVIN_API_URL`, `MARVIN_USER_TOKEN`, `DISPATCH_POLL_SECONDS` (10), `DISPATCH_MAX_PARALLEL` (2), and for Kubernetes
 `DISPATCH_NAMESPACE` (default: its own) and `DISPATCH_SECRET` (a Secret holding `MARVIN_USER_TOKEN`).
 
@@ -44,6 +44,37 @@ rules:
 ```
 
 `python -m marvin_worker run --kind K --job <record> --args '{...}'` does one job and exits (what a Job or `docker run` executes).
+
+## Runners: workers that register what they can do
+
+`python -m marvin_worker work` is a **runner**: a standing worker you can add anywhere (a container on any Docker host, a machine under a desk).
+Give it `MARVIN_API_URL` and a token pinned to the workspace and it **announces itself** (its machine, whether it is idle or busy, and every
+kind it has with that kind's contract), then **claims queued jobs of those kinds and runs them**. No dispatcher is needed and nothing has to
+reach in. Add another container for another capability: an ffmpeg runner, a documents runner. What it offers comes from the modules its image
+loads (`WORKER_JOB_MODULES`), or a subset (`WORKER_KINDS`).
+
+A kind declares its **contract** next to the function, and the worker advertises it in its heartbeat (the `kinds` field of its `worker` record):
+
+```python
+@job_kind("audio-cut", description="Stitch a story's recorded lines",
+          inputs={"story": "string", "source": {"type": "asset", "accepts": ["audio/*"], "required": False}, "size": "integer?"},
+          produces=["audio/mpeg"], needs=["ffmpeg"])
+```
+
+`inputs` are the arguments (`"string"`, `"integer?"` for optional, or `{type, required, description, enum, accepts}`; types: string, number,
+integer, boolean, object, array, asset), `accepts` the media types of files it takes, `produces` what it gives back, `needs` what the machine must
+have. **A job is checked against its kind's contract before anything runs**: missing or wrongly typed arguments, and a file of the wrong media
+type (a PDF sent to an audio cutter), fail the job at once with a plain message on its record.
+
+Two workers reaching for one job: the claim writes `claimed_by`, waits a moment, reads it back and keeps it only if it is still theirs.
+
+### Where it announces and finds jobs: a backend
+
+Announce (heartbeat and capabilities), intake (claim the next job) and report (status, log, results) sit behind one seam (`backend.py`).
+The default keeps all three in Marvin's records (Marvin stays the source of truth; Settings -> Workers reads them). `WORKER_SINKS` (comma-separated
+URLs, `WORKER_SINK_AUTH` for an Authorization header) ALSO posts every announcement and outcome as JSON to those addresses. A queue (RabbitMQ,
+Redis) is another implementation of the same three calls, named by `WORKER_BACKEND=package.module:factory` so its library lives in the image that
+wants it.
 
 ## One base image, many purposes
 
