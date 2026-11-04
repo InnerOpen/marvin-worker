@@ -39,6 +39,12 @@ def entries(creds: Creds) -> list[dict]:
     return body if isinstance(body, list) else body.get("items", [])
 
 
+def query(creds: Creds, spec: dict, *, limit: int = 100) -> list[dict]:
+    """Records matching a query spec (`{"entry_type": "job", "data": {"status": "queued"}}`): Marvin does the filtering."""
+    body = json.dumps({"spec": spec, "limit": limit}).encode()
+    return json.loads(request(creds, "/api/platform/entries/query", method="POST", data=body, content_type="application/json")).get("entries", [])
+
+
 def asset(creds: Creds, asset_id: str) -> dict:
     return json.loads(request(creds, f"/api/platform/assets/{asset_id}"))
 
@@ -61,7 +67,7 @@ def upload_asset(creds: Creds, file: Path, *, slug: str, name: str, mime: str, d
 
 def update_entry(creds: Creds, slug: str, changes: dict) -> dict:
     """Merge `changes` into the record's fields (a PATCH replaces dataJson, so the rest is read and sent back with it)."""
-    row = next((e for e in entries(creds) if e.get("slug") == slug), None)
+    row = next(iter(query(creds, {"entries": slug}, limit=1)), None)  # Marvin looks the one record up; no listing the whole workspace
     if row is None:
         raise MarvinError(f"no record “{slug}” to write to")
     data = {**(row.get("dataJson") or row.get("data") or {}), **changes}

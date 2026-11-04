@@ -7,7 +7,7 @@ Marvin (a workflow's `request` step) posts a job; the worker answers 202 at once
 
 `kind` names a function registered with `@job_kind` (the kinds this image can run; see WORKER_JOB_MODULES); `job` is the slug of the Marvin record the outcome is written to
 (its `status`, a `log`, and whatever fields the job returns); `args` is the job's own input. Marvin's record is the state, so a
-restart loses nothing but a job in flight (its record stays `rendering`: post it again). Jobs run one at a time, in order.
+restart loses nothing but a job in flight (its record stays `running` until the dispatcher times it out). Jobs run one at a time, in order.
 
 Environment: WORKER_JOB_MODULES (modules that define this image's kinds), MARVIN_API_URL, MARVIN_USER_TOKEN (the `marvin` CLI's own name for it; MARVIN_TOKEN also works; a token pinned to the workspace: it can reach nothing else),
 WORKER_TOKEN (the secret Marvin sends as a Bearer token), PORT (default 8080).
@@ -27,7 +27,7 @@ from . import jobs, marvin_api
 from .jobs import Context, JobError
 
 MAX_BODY = 64 * 1024
-RUNNING, DONE, FAILED = "rendering", "done", "failed"  # the status words of the job records Marvin keeps (a record's select offers these)
+RUNNING, DONE, FAILED = "running", "done", "failed"  # the status words of Marvin's `job` records
 
 
 def validate(job: object) -> dict:

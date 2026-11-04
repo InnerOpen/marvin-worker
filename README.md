@@ -12,7 +12,36 @@ GET  /health
 
 `kind` is a function registered with `@job_kind("name")` (`(job, ctx) -> fields for the record`); `job` is the slug of the Marvin
 record that gets `status` (`rendering` → `done` / `failed`), a `log`, and whatever the job returns; `args` is the job's own input.
-Jobs run one at a time, in the order asked. A job that fails says why on its record.
+A standing worker runs jobs one at a time, in the order asked. A job that fails says why on its record.
+
+## The queue: jobs are records in Marvin
+
+A task is a `job` record in Marvin (`kind`, `args`, `status`: queued → claimed → running → done / failed, plus `result` and `log`). A
+workflow creates one with an ordinary entry step. A **dispatcher** (`python -m marvin_worker dispatch`) watches for queued jobs, claims
+each, and starts a worker for it in the mode its **`job-kind`** record says (image, mode, time allowed, resources). The worker writes the
+outcome back onto the record, and a workflow triggered by "job done" can carry on. The dispatcher only calls *out* to Marvin, so
+nothing has to reach in and Marvin never holds keys to the cluster. A started worker is handed Marvin's address and the token.
+
+| mode | starts | needs |
+|---|---|---|
+| `kubernetes` | a Job per run (one attempt, a deadline, the token from a Secret) | a service account that may create Jobs in one namespace (below) |
+| `docker` | `docker run --rm` per run | the Docker CLI and an engine: run the dispatcher on the host, or mount the socket (that is root on the host) |
+| `http` | POST to a standing worker's `/jobs` (`python -m marvin_worker`) | the worker's URL, and `DISPATCH_WORKER_TOKEN` |
+| `local` | a process on the dispatcher's own machine | the kind's module installed there |
+
+A job past its kind's time allowed, with no outcome, is failed so a dead worker doesn't hold a place. Run one dispatcher.
+Environment: `MARVIN_API_URL`, `MARVIN_USER_TOKEN`, `DISPATCH_POLL_SECONDS` (10), `DISPATCH_MAX_PARALLEL` (2), and for Kubernetes
+`DISPATCH_NAMESPACE` (default: its own) and `DISPATCH_SECRET` (a Secret holding `MARVIN_USER_TOKEN`).
+
+```yaml
+# the only cluster access the dispatcher needs
+kind: Role
+metadata: {name: marvin-job-launcher}
+rules:
+  - {apiGroups: [batch], resources: [jobs], verbs: [create, get, list]}
+```
+
+`python -m marvin_worker run --kind K --job <record> --args '{...}'` does one job and exits (what a Job or `docker run` executes).
 
 ## One base image, many purposes
 

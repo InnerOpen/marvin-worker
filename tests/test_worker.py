@@ -37,6 +37,10 @@ class FakeMarvin(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         body = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.path == "/api/platform/entries/query":
+            wanted = json.loads(body)["spec"]["entries"]
+            hits = [e for e in FakeMarvin.entries if e["slug"] == wanted]
+            return self._json(200, {"entries": hits, "total": len(hits)})
         if self.path == "/api/platform/assets/upload":
             FakeMarvin.uploads.append((self.headers["Content-Type"], body))
             return self._json(201, {"id": "asset-new"})
