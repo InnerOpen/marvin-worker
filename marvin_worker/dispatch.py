@@ -161,6 +161,15 @@ REAPERS: dict[str, Callable] = {"docker": reap_docker}
 LAUNCHERS: dict[str, Callable] = {"local": start_local, "docker": start_docker, "http": start_http, "kubernetes": start_kubernetes}
 
 
+HEARTBEAT_SECONDS = 60  # often enough for Marvin's Workers page to see it alive, rarely enough to cost nothing
+
+
+def _host() -> str:
+    import socket
+
+    return os.environ.get("DISPATCH_NAME") or socket.gethostname()
+
+
 class Dispatcher:
     def __init__(
         self,
@@ -173,6 +182,7 @@ class Dispatcher:
     ):
         self.creds, self.max_parallel, self.launchers, self.now = creds, max_parallel, launchers or LAUNCHERS, now
         self.reapers = REAPERS if reapers is None else reapers
+        self.name, self.started_at, self.jobs_started, self._beat = _host(), now().isoformat(), 0, None
 
     def _jobs(self, status: str) -> list[dict]:
         return marvin_api.query(self.creds, {"entry_type": "job", "data": {"status": status}, "sort": {"by": "created_at", "direction": "asc"}})
@@ -194,9 +204,26 @@ class Dispatcher:
                 if started and (self.now() - datetime.fromisoformat(started)).total_seconds() > allowed:
                     self._fail(row, f"No outcome within {allowed - GRACE_SECONDS} s of being picked up; the worker probably died. Queue it again to retry.")
 
+    def heartbeat(self, kinds: dict[str, dict]) -> None:
+        """Say this dispatcher is alive: one `worker` record (named for the machine) whose `last_seen` Marvin's Workers page reads. At
+        most once a minute, and never fatal: a workspace without the `worker` type just has no heartbeat."""
+        now = self.now()
+        if self._beat is not None and (now - self._beat).total_seconds() < HEARTBEAT_SECONDS:
+            return
+        self._beat = now
+        modes = sorted({str(k.get("mode") or "kubernetes") for k in kinds.values()})
+        try:
+            marvin_api.upsert_entry(
+                self.creds, "worker", f"worker-dispatcher-{_name(self.name)[3:]}", f"Dispatcher on {self.name}",
+                {"role": "dispatcher", "host": self.name, "modes": ", ".join(modes), "last_seen": now.isoformat(), "started_at": self.started_at, "jobs_started": self.jobs_started},
+            )  # fmt: skip
+        except marvin_api.MarvinError:
+            pass
+
     def tick(self) -> int:
         """One pass. Returns how many jobs it started."""
         kinds = self._kinds()
+        self.heartbeat(kinds)
         for mode in {str(k.get("mode") or "kubernetes") for k in kinds.values()}:
             if mode in self.reapers:
                 self.reapers[mode](self.creds)  # workers that ended without reporting are failed now, not at the timeout
@@ -219,6 +246,7 @@ class Dispatcher:
             try:
                 launcher({"kind": data["kind"], "job": row["slug"], "args": data.get("args") or {}}, kind, self.creds)
                 started += 1
+                self.jobs_started += 1
             except LaunchError as e:
                 self._fail(row, str(e))
         return started

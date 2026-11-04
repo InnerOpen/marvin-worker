@@ -24,10 +24,17 @@ class FakeMarvin(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(body).encode())
 
     def do_GET(self):  # noqa: N802
+        if self.path == "/api/platform/entry-types":
+            return self._json(200, [{"slug": "worker", "id": "type-worker"}])
         self._json(200, FakeMarvin.rows)
 
     def do_POST(self):  # noqa: N802
-        spec = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["spec"]
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/platform/entries":  # create
+            row = {"id": f"id-{payload['slug']}", "slug": payload["slug"], "entryType": "worker", "dataJson": payload["dataJson"]}
+            FakeMarvin.rows.append(row)
+            return self._json(201, row)
+        spec = payload["spec"]
         if "entries" in spec:  # one record by slug
             hits = [r for r in FakeMarvin.rows if r["slug"] == spec["entries"]]
             return self._json(200, {"entries": hits, "total": len(hits)})
@@ -251,3 +258,23 @@ def test_the_dispatcher_reaps_for_the_modes_in_use_before_it_starts_anything(mar
     dispatch.Dispatcher(marvin, launchers={}, reapers={"docker": lambda creds: reaped.append(creds)}, now=lambda: NOW).tick()
 
     assert reaped == [marvin]
+
+
+def test_the_dispatcher_reports_in_once_a_minute_with_what_it_has_done(marvin):
+    FakeMarvin.rows = [_kind(), _job("job-1")]
+    clock = [NOW]
+    dispatcher = dispatch.Dispatcher(marvin, launchers={"local": lambda job, kind, c: None}, reapers={}, now=lambda: clock[0])
+
+    dispatcher.tick()
+    beat = next(r for r in FakeMarvin.rows if r["slug"].startswith("worker-dispatcher-"))
+    assert beat["dataJson"]["last_seen"] == NOW.isoformat() and beat["dataJson"]["modes"] == "local" and beat["dataJson"]["role"] == "dispatcher"
+
+    clock[0] = NOW + timedelta(seconds=20)
+    FakeMarvin.rows.append(_job("job-2"))
+    dispatcher.tick()
+    assert beat["dataJson"]["last_seen"] == NOW.isoformat()  # not yet a minute: no second write
+
+    clock[0] = NOW + timedelta(seconds=75)
+    dispatcher.tick()
+    assert beat["dataJson"]["last_seen"] == clock[0].isoformat() and beat["dataJson"]["jobs_started"] == 2  # both jobs counted
+    assert len([r for r in FakeMarvin.rows if r["slug"].startswith("worker-dispatcher-")]) == 1  # one record, updated in place
