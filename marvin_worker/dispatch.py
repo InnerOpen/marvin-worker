@@ -16,6 +16,7 @@ Secret that holds MARVIN_USER_TOKEN under that key).
 
 import json
 import os
+import shutil
 import ssl
 import subprocess
 import sys
@@ -181,6 +182,19 @@ REAPERS: dict[str, Callable] = {"docker": reap_docker}
 LAUNCHERS: dict[str, Callable] = {"local": start_local, "docker": start_docker, "http": start_http, "kubernetes": start_kubernetes}
 
 
+def available_modes() -> set[str]:
+    """The modes of job-kind this machine can actually start. `local` and `http` need nothing; `docker` needs the container CLI
+    (`docker`, or `podman` with WORKER_CONTAINER_CLI), which a pod does not have; `kubernetes` needs the in-cluster token (or
+    DISPATCH_KUBE_TOKEN). A dispatcher takes only these, so several can share one workspace (one on a Docker host, one in a cluster) and
+    none fails or cleans up another's kind."""
+    modes = {"local", "http"}
+    if shutil.which(container_cli()):
+        modes.add("docker")
+    if os.environ.get("DISPATCH_KUBE_TOKEN") or (KUBE_DIR / "token").exists():
+        modes.add("kubernetes")
+    return modes
+
+
 HEARTBEAT_SECONDS = 60  # often enough for Marvin's Workers page to see it alive, rarely enough to cost nothing
 
 
@@ -200,9 +214,14 @@ class Dispatcher:
         reapers: dict[str, Callable] | None = None,
         now: Callable = _now,
         claim_settle: float = 0.4,
+        modes: set[str] | None = None,
     ):
         self.creds, self.max_parallel, self.launchers, self.now = creds, max_parallel, launchers or LAUNCHERS, now
         self.reapers = REAPERS if reapers is None else reapers
+        # What this dispatcher may start: the machine's (available_modes), unless the caller names the launchers and reapers itself.
+        explicit = launchers is not None or reapers is not None
+        self.modes = modes if modes is not None else (set(self.launchers) | set(self.reapers) if explicit else available_modes())
+        self._reap_warned: set[str] = set()
         self.name, self.started_at, self.jobs_started, self._beat = _host(), now().isoformat(), 0, None
         self.claim_settle = claim_settle  # seconds to wait for a rival's write before keeping a claim
 
@@ -246,10 +265,16 @@ class Dispatcher:
     def tick(self) -> int:
         """One pass. Returns how many jobs it started."""
         kinds = self._kinds()
-        self.heartbeat(kinds)
-        for mode in {str(k.get("mode") or "kubernetes") for k in kinds.values()}:
+        mine = {name: k for name, k in kinds.items() if str(k.get("mode") or "kubernetes") in self.modes}
+        self.heartbeat(mine)  # offers (and counts modes for) only what this dispatcher can start
+        for mode in {str(k.get("mode") or "kubernetes") for k in mine.values()}:
             if mode in self.reapers:
-                self.reapers[mode](self.creds)  # workers that ended without reporting are failed now, not at the timeout
+                try:
+                    self.reapers[mode](self.creds)  # workers that ended without reporting are failed now, not at the timeout
+                except Exception as e:  # noqa: BLE001 — a cleanup that cannot run must not stop jobs starting
+                    if mode not in self._reap_warned:
+                        self._reap_warned.add(mode)
+                        print(f"cleaning up {mode} workers failed ({type(e).__name__}: {e}); jobs still start", flush=True)
         self._time_out(kinds)
         free = self.max_parallel - len(self._jobs("claimed")) - len(self._jobs("running"))
         started = 0
@@ -261,10 +286,13 @@ class Dispatcher:
             if kind is None:
                 self._fail(row, f"No job-kind “{data.get('kind')}” is registered: add one to say which image runs it.")
                 continue
-            launcher = self.launchers.get(str(kind.get("mode") or "kubernetes"))
+            mode = str(kind.get("mode") or "kubernetes")
+            launcher = self.launchers.get(mode)
             if launcher is None:
                 self._fail(row, f"Unknown mode “{kind.get('mode')}” for kind {data.get('kind')}.")
                 continue
+            if mode not in self.modes:
+                continue  # a kind another dispatcher starts (this one has no way to): leave it queued for that one
             if not marvin_api.claim(self.creds, row["slug"], f"dispatcher {self.name}", self.now().isoformat(), settle=self.claim_settle):
                 continue  # another worker took it
             try:
