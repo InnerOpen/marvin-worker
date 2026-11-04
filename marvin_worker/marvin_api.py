@@ -3,6 +3,7 @@ Standard library only. Python's default user agent is refused by Marvin's edge, 
 beyond these calls a job does with the Marvin CLI (`ctx.marvin(...)`) rather than another client here."""
 
 import json
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -19,19 +20,35 @@ class MarvinError(RuntimeError):
 Creds = tuple[str, str]  # Marvin's address and a token pinned to the workspace
 
 
-def request(creds: Creds, path: str, *, method: str = "GET", data: bytes | None = None, content_type: str | None = None) -> bytes:
+RETRY_STATUS = (429, 502, 503, 504)  # Marvin is busy or a proxy blinked: worth another go
+READ_ATTEMPTS = 4
+
+
+def request(creds: Creds, path: str, *, method: str = "GET", data: bytes | None = None, content_type: str | None = None, pause: float = 1.0) -> bytes:
+    """One call to Marvin. A read (GET) that fails on a dropped connection or a busy answer is tried again a few times, a pull downloads
+    dozens of files and one blink should not lose the job. A write is never repeated: it might already have happened."""
     base, token = creds
     headers = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT, "Accept": "*/*"}
     if content_type:
         headers["Content-Type"] = content_type
-    req = urllib.request.Request(base.rstrip("/") + path, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        raise MarvinError(f"Marvin answered {e.code} for {path}: {e.read()[:200].decode('utf-8', 'replace')}") from e
-    except urllib.error.URLError as e:
-        raise MarvinError(f"can't reach Marvin ({e.reason})") from e
+    attempts = READ_ATTEMPTS if method == "GET" else 1
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(base.rstrip("/") + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code in RETRY_STATUS and attempt < attempts:
+                time.sleep(pause * attempt)
+                continue
+            raise MarvinError(f"Marvin answered {e.code} for {path}: {e.read()[:200].decode('utf-8', 'replace')}") from e
+        except (urllib.error.URLError, OSError) as e:  # URLError covers a refused or failed connection; OSError a reset or a dropped TLS stream mid-read
+            if attempt < attempts:
+                time.sleep(pause * attempt)
+                continue
+            reason = getattr(e, "reason", e)
+            raise MarvinError(f"can't reach Marvin ({reason})") from e
+    raise MarvinError(f"can't reach Marvin for {path}")  # not reached
 
 
 def entries(creds: Creds) -> list[dict]:
