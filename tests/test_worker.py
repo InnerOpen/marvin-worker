@@ -174,3 +174,26 @@ def test_a_job_can_run_the_marvin_cli_as_the_workers_token(tmp_path, monkeypatch
     fake.write_text("#!/bin/sh\necho nope >&2\nexit 3\n")
     with pytest.raises(jobs.JobError, match="nope"):
         jobs.Context(creds=("u", "t"), work=tmp_path).marvin("platform", "x")
+
+
+def test_run_once_does_the_job_writes_the_record_and_exits_with_the_outcome(marvin, hello, monkeypatch):
+    monkeypatch.setenv("MARVIN_API_URL", marvin[0])
+    monkeypatch.setenv("MARVIN_USER_TOKEN", marvin[1])
+    monkeypatch.setenv("WORKER_JOB_MODULES", "")
+
+    assert serve.run_once(["--kind", "hello", "--job", "job-1", "--args", '{"name": "once"}']) == 0
+    assert _data()["status"] == "done" and _data()["log"] == "hello once"
+
+    monkeypatch.setenv("WORKER_JOB", json.dumps({"kind": "boom-not-registered", "job": "job-1"}))
+    assert serve.run_once([]) == 2  # a job this image can't take is refused, not run
+
+    @jobs.job_kind("boom")
+    def boom(job, ctx):
+        raise jobs.JobError("nope")
+
+    try:
+        monkeypatch.setenv("WORKER_JOB", json.dumps({"kind": "boom", "job": "job-1"}))
+        assert serve.run_once([]) == 1  # failed: the record says why, and the process exit says so too (a CI step goes red)
+    finally:
+        del jobs.HANDLERS["boom"]
+    assert _data()["status"] == "failed"
