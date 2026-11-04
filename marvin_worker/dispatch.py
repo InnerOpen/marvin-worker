@@ -2,7 +2,7 @@
 
 Marvin holds the queue (a `job` record per task) and the settings (a `job-kind` record per kind: image, mode, time allowed). This
 only calls OUT to Marvin, so it can sit beside a cluster or a Docker host without Marvin reaching in or holding any keys to it.
-Each pass: time out jobs that stopped making progress, then claim queued jobs (up to DISPATCH_MAX_PARALLEL running at once) and
+Each pass: fail jobs whose worker ended without reporting (docker mode) or stopped making progress, then claim queued jobs (up to DISPATCH_MAX_PARALLEL running at once) and
 start them. A started worker is told Marvin's address and the token, writes the outcome onto its record, and exits.
 
 Modes: `kubernetes` (a Job per run), `docker` (a container per run; the dispatcher needs the Docker CLI and access to a Docker
@@ -63,7 +63,7 @@ def start_docker(job: dict, kind: dict, creds: marvin_api.Creds) -> None:
     resources = kind.get("resources") or {}
     limits = [*(["--cpus", str(resources["cpu"])] if resources.get("cpu") else []), *(["--memory", str(resources["memory"])] if resources.get("memory") else [])]
     # The token goes in by NAME (-e VAR): the docker CLI reads it from its own environment, so it is not in any process listing.
-    cmd = ["docker", "run", "--rm", "-d", "--name", _name(job["job"]), "-e", "MARVIN_USER_TOKEN", "-e", f"MARVIN_API_URL={creds[0]}", *limits, kind["image"], *_command(job)]
+    cmd = ["docker", "run", "-d", "--name", _name(job["job"]), "--label", "marvin-worker=1", "--label", f"marvin-job={job['job']}", "-e", "MARVIN_USER_TOKEN", "-e", f"MARVIN_API_URL={creds[0]}", *limits, kind["image"], *_command(job)]
     done = subprocess.run(cmd, env={**os.environ, "MARVIN_USER_TOKEN": creds[1]}, capture_output=True, text=True, timeout=120)  # noqa: S603
     if done.returncode != 0:
         raise LaunchError(f"docker run failed: {(done.stderr or done.stdout).strip()[:300]}")
@@ -130,12 +130,59 @@ def start_kubernetes(job: dict, kind: dict, creds: marvin_api.Creds, *, api: str
         raise LaunchError(f"can't reach Kubernetes: {e}") from e
 
 
+def reap_docker(creds: marvin_api.Creds) -> int:
+    """Clean up the worker containers that have exited. A job record still `claimed` or `running` when its container is gone
+    never got an outcome (the worker died, or could not start): fail it with the container's last output, so it shows at once and
+    not at the timeout. Returns how many containers it removed. Containers are kept after exit (no --rm) exactly so this can read them."""
+
+    def docker(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=60)  # noqa: S603
+
+    listed = docker("ps", "-a", "--filter", "label=marvin-worker=1", "--filter", "status=exited", "--format", '{{.Names}}\t{{.Label "marvin-job"}}')
+    if listed.returncode != 0:
+        return 0
+    removed = 0
+    for line in listed.stdout.splitlines():
+        name, _, slug = line.partition("\t")
+        if not name:
+            continue
+        rows = marvin_api.query(creds, {"entries": slug}, limit=1) if slug else []
+        status = ((rows[0].get("dataJson") or {}).get("status") if rows else None)
+        if status in ("claimed", "running"):
+            code = docker("inspect", "-f", "{{.State.ExitCode}}", name).stdout.strip()
+            tail = (docker("logs", "--tail", "15", name).stdout + docker("logs", "--tail", "15", name).stderr).strip()[-600:]
+            marvin_api.update_entry(creds, slug, {"status": "failed", "log": f"The worker container exited (code {code}) before reporting an outcome.\n{tail}"})
+        docker("rm", name)
+        removed += 1
+    return removed
+
+
+REAPERS: dict[str, Callable] = {"docker": reap_docker}
 LAUNCHERS: dict[str, Callable] = {"local": start_local, "docker": start_docker, "http": start_http, "kubernetes": start_kubernetes}
 
 
+HEARTBEAT_SECONDS = 60  # often enough for Marvin's Workers page to see it alive, rarely enough to cost nothing
+
+
+def _host() -> str:
+    import socket
+
+    return os.environ.get("DISPATCH_NAME") or socket.gethostname()
+
+
 class Dispatcher:
-    def __init__(self, creds: marvin_api.Creds, *, max_parallel: int = 2, launchers: dict[str, Callable] | None = None, now: Callable = _now):
+    def __init__(
+        self,
+        creds: marvin_api.Creds,
+        *,
+        max_parallel: int = 2,
+        launchers: dict[str, Callable] | None = None,
+        reapers: dict[str, Callable] | None = None,
+        now: Callable = _now,
+    ):
         self.creds, self.max_parallel, self.launchers, self.now = creds, max_parallel, launchers or LAUNCHERS, now
+        self.reapers = REAPERS if reapers is None else reapers
+        self.name, self.started_at, self.jobs_started, self._beat = _host(), now().isoformat(), 0, None
 
     def _jobs(self, status: str) -> list[dict]:
         return marvin_api.query(self.creds, {"entry_type": "job", "data": {"status": status}, "sort": {"by": "created_at", "direction": "asc"}})
@@ -157,9 +204,29 @@ class Dispatcher:
                 if started and (self.now() - datetime.fromisoformat(started)).total_seconds() > allowed:
                     self._fail(row, f"No outcome within {allowed - GRACE_SECONDS} s of being picked up; the worker probably died. Queue it again to retry.")
 
+    def heartbeat(self, kinds: dict[str, dict]) -> None:
+        """Say this dispatcher is alive: one `worker` record (named for the machine) whose `last_seen` Marvin's Workers page reads. At
+        most once a minute, and never fatal: a workspace without the `worker` type just has no heartbeat."""
+        now = self.now()
+        if self._beat is not None and (now - self._beat).total_seconds() < HEARTBEAT_SECONDS:
+            return
+        self._beat = now
+        modes = sorted({str(k.get("mode") or "kubernetes") for k in kinds.values()})
+        try:
+            marvin_api.upsert_entry(
+                self.creds, "worker", f"worker-dispatcher-{_name(self.name)[3:]}", f"Dispatcher on {self.name}",
+                {"role": "dispatcher", "host": self.name, "modes": ", ".join(modes), "last_seen": now.isoformat(), "started_at": self.started_at, "jobs_started": self.jobs_started},
+            )  # fmt: skip
+        except marvin_api.MarvinError:
+            pass
+
     def tick(self) -> int:
         """One pass. Returns how many jobs it started."""
         kinds = self._kinds()
+        self.heartbeat(kinds)
+        for mode in {str(k.get("mode") or "kubernetes") for k in kinds.values()}:
+            if mode in self.reapers:
+                self.reapers[mode](self.creds)  # workers that ended without reporting are failed now, not at the timeout
         self._time_out(kinds)
         free = self.max_parallel - len(self._jobs("claimed")) - len(self._jobs("running"))
         started = 0
@@ -179,6 +246,7 @@ class Dispatcher:
             try:
                 launcher({"kind": data["kind"], "job": row["slug"], "args": data.get("args") or {}}, kind, self.creds)
                 started += 1
+                self.jobs_started += 1
             except LaunchError as e:
                 self._fail(row, str(e))
         return started

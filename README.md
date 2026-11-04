@@ -29,7 +29,9 @@ nothing has to reach in and Marvin never holds keys to the cluster. A started wo
 | `http` | POST to a standing worker's `/jobs` (`python -m marvin_worker`) | the worker's URL, and `DISPATCH_WORKER_TOKEN` |
 | `local` | a process on the dispatcher's own machine | the kind's module installed there |
 
-A job past its kind's time allowed, with no outcome, is failed so a dead worker doesn't hold a place. Run one dispatcher.
+A job past its kind's time allowed, with no outcome, is failed so a dead worker doesn't hold a place. In docker mode a worker container that dies before reporting fails its job at once, with its last output. Run one dispatcher. It also keeps a `worker` record (its machine, the modes it starts, `last_seen` rewritten about once a minute) that Marvin's **Settings → Workers** page reads to say whether anything is watching the queue.
+
+The record types a workspace needs for this: `job` (kind, args, status, result, log, attempts, claimed_at), `job-kind` (kind, mode, image, url, timeout_seconds, resources, notes) and `worker` (role, host, modes, last_seen, started_at, jobs_started).
 Environment: `MARVIN_API_URL`, `MARVIN_USER_TOKEN`, `DISPATCH_POLL_SECONDS` (10), `DISPATCH_MAX_PARALLEL` (2), and for Kubernetes
 `DISPATCH_NAMESPACE` (default: its own) and `DISPATCH_SECRET` (a Secret holding `MARVIN_USER_TOKEN`).
 

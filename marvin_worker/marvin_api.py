@@ -72,3 +72,14 @@ def update_entry(creds: Creds, slug: str, changes: dict) -> dict:
         raise MarvinError(f"no record “{slug}” to write to")
     data = {**(row.get("dataJson") or row.get("data") or {}), **changes}
     return json.loads(request(creds, f"/api/platform/entries/{row['id']}", method="PATCH", data=json.dumps({"dataJson": data}).encode(), content_type="application/json"))
+
+
+def upsert_entry(creds: Creds, entry_type: str, slug: str, title: str, data: dict) -> dict:
+    """Create the record if it is not there, else merge `data` into it: for a record the worker itself keeps (its heartbeat)."""
+    if query(creds, {"entries": slug}, limit=1):
+        return update_entry(creds, slug, data)
+    types = {t["slug"]: t["id"] for t in json.loads(request(creds, "/api/platform/entry-types"))}
+    if entry_type not in types:
+        raise MarvinError(f"this workspace has no “{entry_type}” entry type")
+    body = json.dumps({"entryTypeId": types[entry_type], "title": title, "slug": slug, "status": "draft", "dataJson": data}).encode()
+    return json.loads(request(creds, "/api/platform/entries", method="POST", data=body, content_type="application/json"))
