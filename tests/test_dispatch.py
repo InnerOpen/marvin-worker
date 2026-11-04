@@ -284,6 +284,53 @@ def test_the_dispatcher_reaps_for_the_modes_in_use_before_it_starts_anything(mar
     assert reaped == [marvin]
 
 
+def test_a_kind_this_dispatcher_cannot_start_is_left_queued_for_another_one(marvin):
+    """A dispatcher in a pod has no Docker: a docker-mode job is not its to fail or claim, and a kubernetes-mode job in the same pass still starts."""
+    FakeMarvin.rows = [_kind(kind="a", mode="docker"), _kind(kind="b", mode="kubernetes"), _job("job-a", kind="a"), _job("job-b", kind="b")]
+    started = []
+    launchers = {"docker": lambda job, kind, c: started.append(job["job"]), "kubernetes": lambda job, kind, c: started.append(job["job"])}
+
+    dispatcher = dispatch.Dispatcher(marvin, launchers=launchers, reapers={}, now=lambda: NOW, claim_settle=0, modes={"kubernetes"})
+
+    assert dispatcher.tick() == 1
+    assert started == ["job-b"]
+    assert _data("job-a")["status"] == "queued"  # untouched: not claimed, not failed
+
+
+def test_a_cleanup_that_cannot_run_does_not_stop_jobs_from_starting(marvin, capsys):
+    FakeMarvin.rows = [_kind(mode="docker"), _job("job-1")]
+    started = []
+
+    def reaper(creds):
+        raise FileNotFoundError("docker")
+
+    dispatcher = dispatch.Dispatcher(marvin, launchers={"docker": lambda job, kind, c: started.append(job["job"])}, reapers={"docker": reaper}, now=lambda: NOW, claim_settle=0)
+
+    assert dispatcher.tick() == 1 and started == ["job-1"]
+    dispatcher.tick()
+    assert capsys.readouterr().out.count("cleaning up docker workers failed") == 1  # said once, not every pass
+
+
+def test_the_modes_a_machine_can_start_follow_what_it_has(monkeypatch, tmp_path):
+    monkeypatch.delenv("DISPATCH_KUBE_TOKEN", raising=False)
+    monkeypatch.setattr(dispatch, "KUBE_DIR", tmp_path)  # no service-account token here
+    monkeypatch.setattr(dispatch.shutil, "which", lambda name: None)
+    assert dispatch.available_modes() == {"local", "http"}
+
+    monkeypatch.setattr(dispatch.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert dispatch.available_modes() == {"local", "http", "docker"}
+
+    (tmp_path / "token").write_text("t")  # in a pod
+    assert dispatch.available_modes() == {"local", "http", "docker", "kubernetes"}
+
+
+def test_the_heartbeat_offers_only_the_kinds_this_dispatcher_can_start(marvin):
+    FakeMarvin.rows = [_kind(kind="a", mode="docker"), _kind(kind="b", mode="kubernetes")]
+    dispatch.Dispatcher(marvin, launchers={"docker": lambda *a: None, "kubernetes": lambda *a: None}, reapers={}, now=lambda: NOW, claim_settle=0, modes={"kubernetes"}).tick()
+    beat = next(r for r in FakeMarvin.rows if r["slug"].startswith("worker-dispatcher-"))["dataJson"]
+    assert beat["modes"] == "kubernetes" and [k["kind"] for k in beat["kinds"]] == ["b"]
+
+
 def test_the_dispatcher_reports_in_once_a_minute_with_what_it_has_done(marvin):
     FakeMarvin.rows = [_kind(), _job("job-1")]
     clock = [NOW]
