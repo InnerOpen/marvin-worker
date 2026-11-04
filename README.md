@@ -14,6 +14,8 @@ GET  /health
 record that gets `status` (`rendering` → `done` / `failed`), a `log`, and whatever the job returns; `args` is the job's own input.
 A standing worker runs jobs one at a time, in the order asked. A job that fails says why on its record.
 
+How to run it on Docker, Podman or Kubernetes: **[docs/deploy.md](docs/deploy.md)**.
+
 ## The queue: jobs are records in Marvin
 
 A task is a `job` record in Marvin (`kind`, `args`, `status`: queued → claimed → running → done / failed, plus `result` and `log`). A
@@ -25,7 +27,7 @@ nothing has to reach in and Marvin never holds keys to the cluster. A started wo
 | mode | starts | needs |
 |---|---|---|
 | `kubernetes` | a Job per run (one attempt, a deadline, the token from a Secret) | a service account that may create Jobs in one namespace (below) |
-| `docker` | `docker run --rm` per run | the Docker CLI and an engine: run the dispatcher on the host, or mount the socket (that is root on the host) |
+| `docker` | `docker run` per run (`podman` too: `WORKER_CONTAINER_CLI=podman`); the container is kept until read, then removed | the Docker CLI and an engine: run the dispatcher on the host, or mount the socket (that is root on the host) |
 | `http` | POST to a standing worker's `/jobs` (`python -m marvin_worker`) | the worker's URL, and `DISPATCH_WORKER_TOKEN` |
 | `local` | a process on the dispatcher's own machine | the kind's module installed there |
 

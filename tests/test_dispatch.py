@@ -155,7 +155,7 @@ def test_the_kubernetes_job_runs_once_with_a_deadline_and_the_token_from_a_secre
     spec = manifest["spec"]
     assert (spec["backoffLimit"], spec["activeDeadlineSeconds"], spec["template"]["spec"]["restartPolicy"]) == (0, 900, "Never")
     (container,) = spec["template"]["spec"]["containers"]
-    assert container["args"] == ["run", "--kind", "audio-cut", "--job", "job-1", "--args", '{"story": "s"}']
+    assert container["command"] == ["python", "-m", "marvin_worker", "run", "--kind", "audio-cut", "--job", "job-1", "--args", '{"story": "s"}'] and "args" not in container
     env = {e["name"]: e for e in container["env"]}
     assert env["MARVIN_API_URL"]["value"] == "https://marvin.example"
     assert "value" not in env["MARVIN_USER_TOKEN"] and env["MARVIN_USER_TOKEN"]["valueFrom"]["secretKeyRef"] == {"name": "marvin-worker", "key": "MARVIN_USER_TOKEN"}
@@ -227,7 +227,11 @@ class _Docker:
 
     def __call__(self, cmd, **kw):
         self.calls.append(cmd[1])
-        out = {"ps": "".join(f"{n}\t{slug}\n" for n, slug in self.containers), "inspect": self.code + "\n", "logs": self.logs}.get(cmd[1], "")
+        if cmd[1] == "inspect":  # the exit code, or a container's job label, by which field is asked for
+            name = cmd[-1]
+            out = (self.code if "ExitCode" in cmd[3] else dict(self.containers).get(name, "")) + "\n"
+        else:
+            out = {"ps": "".join(f"{n}\n" for n, _ in self.containers), "logs": self.logs}.get(cmd[1], "")
         return subprocess.CompletedProcess(cmd, 0, out, "")
 
 
@@ -249,7 +253,7 @@ def test_a_container_that_finished_after_reporting_is_only_cleaned_up_not_failed
 
     assert dispatch.reap_docker(marvin) == 1
 
-    assert _data("job-1")["status"] == "done" and "inspect" not in docker.calls and docker.calls[-1] == "rm"
+    assert _data("job-1")["status"] == "done" and docker.calls[-1] == "rm"
 
 
 def test_what_a_finished_container_printed_is_kept_on_its_job_after_the_jobs_own_log(marvin, monkeypatch):
@@ -431,3 +435,10 @@ def test_a_queue_backend_is_named_by_module_and_loaded_the_same_way_as_a_job_kin
     monkeypatch.delenv("WORKER_SINKS", raising=False)
 
     assert type(backends.load_backend(("u", "t"))).__name__ == "Q"
+
+
+def test_the_container_command_is_docker_unless_podman_is_asked_for(monkeypatch):
+    monkeypatch.delenv("WORKER_CONTAINER_CLI", raising=False)
+    assert dispatch.container_cli() == "docker"
+    monkeypatch.setenv("WORKER_CONTAINER_CLI", "podman")
+    assert dispatch.container_cli() == "podman"
