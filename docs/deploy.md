@@ -1,25 +1,57 @@
-# Deploying workers: Docker, Podman, Kubernetes
+# Running workers: a process, Docker, Podman, Kubernetes or OpenShift
 
-A worker is a small Python program (`python -m marvin_worker`) that talks to Marvin's API. Nothing reaches in: it only calls out, so it can sit
-behind any firewall. Pick a shape, then a platform.
+A worker is a small Python program (`python -m marvin_worker`) that talks to Marvin's API. Nothing reaches in (except the standing HTTP shape
+below): it calls out, so it can sit behind any firewall. It authenticates with **a token and nothing else**: `MARVIN_USER_TOKEN` and
+`MARVIN_API_URL` in its environment, wherever it runs. Settings -> Workers in Marvin shows these commands with your address filled in.
 
-| shape | what runs | use it when |
-|---|---|---|
-| **runner** (`work`) | one standing container or process per capability; it registers what it can do and takes matching jobs | you want a worker always there (an ffmpeg runner on a spare machine) |
-| **dispatcher** (`dispatch`) | one small process that starts a fresh container (Docker/Podman) or Kubernetes Job per queued job, then it exits | you want isolation and no idle workers |
-| **standing HTTP worker** (`serve`) | a container with a public URL that Marvin's `request` step calls | the worker is on the public internet and you want Marvin to push jobs |
+## The three shapes
 
-You always need three things first.
+| shape | command | lifetime | how it gets jobs | needs something always on |
+|---|---|---|---|---|
+| **runner** | `work` | stays up | it asks Marvin for jobs it can do (outbound only, no public address) | the runner |
+| **dispatcher + one-shot containers** | `dispatch` starts `run` | the container exists for one job, then exits and is removed | the dispatcher watches the queue and starts a container (Docker/Podman) or Kubernetes Job per job | **the dispatcher** |
+| **standing HTTP worker** | `serve` | stays up | Marvin POSTs the job to its URL (a `job-kind` of mode `http`) | the worker, and a public URL |
 
-1. **A token pinned to one workspace**, so the worker can reach nothing else: `marvin tokens create --pin <workspace>`. Keep it in a secret store, never
-   in an image or a Git repo.
-2. **The three record types** in the workspace: `job`, `job-kind`, `worker` (field lists are in the README). A "Workers" package will install them in one step.
-3. **An image.** Build the base once, then a purpose image from it (see the README, "One base image, many purposes"):
+"Ephemeral" jobs are the second row. The container registers nothing and starts nothing: a small dispatcher has to be running to launch it. That
+dispatcher is the grey or green "dispatcher" on Settings -> Workers; the one-shot containers never appear there. A runner is the simplest to keep up
+on a machine that has the tools (ffmpeg), and a dispatcher is what gives each job a clean, isolated container.
+
+Where each can run:
+
+| | runner | dispatcher | one-shot job container | standing HTTP |
+|---|---|---|---|---|
+| a process on a machine | yes | yes | (the dispatcher's `local` mode) | yes |
+| Docker | yes | on the Docker host (not inside a container) | yes | yes |
+| Podman | yes | yes (`WORKER_CONTAINER_CLI=podman`) | yes | yes |
+| Kubernetes / OpenShift | a Deployment | a Deployment + Role | a Job per run | a Deployment + Service |
+
+## Before any of them
+
+1. **Add the record types** workers use to the workspace (core ships them; it never overwrites what you have):
+   `marvin platform workers setup`, or the "Set up workers" button on Settings -> Workers. If you already have a record type named `job` or
+   `worker` for something else, setup says it does not fit and leaves it alone: rename yours first.
+2. **Make a token pinned to one workspace**, so the worker can reach nothing else:
+   `marvin user tokens create --name worker --pin <workspace-slug>`. Keep it in a secret store, never in an image or a Git repo.
+3. **An image**, for a container or pod. Build the base once, then a purpose image from it (see the README, "One base image, many purposes"):
 
    ```sh
    docker build -f docker/Dockerfile -t marvin-worker-base .       # or: podman build ...
    docker build -t my-worker ./my-pack                              # FROM marvin-worker-base, sets WORKER_JOB_MODULES
    ```
+
+   Rebuild both after the worker code changes: an image built before the runner existed treats `work` as the old standing-server mode.
+
+## A process on a machine
+
+```sh
+git clone https://github.com/InnerOpen/marvin-worker && cd marvin-worker && pip install .
+export MARVIN_API_URL=https://api.example.com MARVIN_USER_TOKEN=...   # the token, from your secret store
+export WORKER_NAME=my-runner WORKER_JOB_MODULES=my_pack.jobs          # the modules that define your kinds of job
+python -m marvin_worker work          # a runner;  `dispatch` for a dispatcher
+```
+
+Keep it running with systemd (a user unit with `Restart=always` and an `EnvironmentFile=` holding the variables, mode 600) or tmux. It shows up on
+Settings -> Workers within a minute. Set `WORKER_POLL_SECONDS=3` to look for jobs more often.
 
 ## Docker
 
@@ -59,7 +91,10 @@ A runner under Podman: `podman run -d --name my-runner --restart unless-stopped 
 
 Tested on Podman 4.6 (rootless): a started container, its exit code and output read back, the output appended to the job's log, and the container removed.
 
-## Kubernetes
+## Kubernetes and OpenShift
+
+OpenShift takes the same manifests: use `oc` where this says `kubectl` (`oc create secret generic marvin-worker --from-literal=MARVIN_USER_TOKEN=...`,
+`oc apply -f`). It assigns an arbitrary non-root user id, which the images are built for. Not yet tried on OpenShift or any real cluster.
 
 **A dispatcher that makes a Job per run.** It needs a ServiceAccount that may create Jobs in one namespace, and a Secret holding the token. The
 Job it creates gets Marvin's address and the token from that Secret (never written into the Job), one attempt (`backoffLimit: 0`), a deadline from

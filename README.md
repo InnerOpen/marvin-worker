@@ -96,7 +96,7 @@ The Storyworld media worker (ffmpeg + `audio-cut`) is the first one, in the Stor
 ## Configuration
 
 On the worker: `MARVIN_API_URL`, `MARVIN_USER_TOKEN` (a token pinned to one workspace, so it can reach nothing else; mint it with
-`marvin tokens create --pin <workspace>`; the `marvin` CLI reads the same two), `WORKER_TOKEN`, `WORKER_JOB_MODULES`, `PORT` (8080).
+`marvin user tokens create --name worker --pin <workspace>`; the `marvin` CLI reads the same two), `WORKER_TOKEN`, `WORKER_JOB_MODULES`, `PORT` (8080).
 
 In Marvin, the worker's address and secret are an ordinary workspace Variable and Secret, so a workflow's `request` step reads them and
 nothing is written into a workflow (its `request` step reaches public hosts only, so the worker needs a public URL):
