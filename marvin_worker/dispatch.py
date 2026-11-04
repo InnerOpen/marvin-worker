@@ -57,16 +57,21 @@ def start_local(job: dict, kind: dict, creds: marvin_api.Creds) -> None:
     subprocess.Popen([sys.executable, *_command(job)[1:]], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # noqa: S603
 
 
+def container_cli() -> str:
+    """The container command: `docker`, or `podman` (set WORKER_CONTAINER_CLI), whose CLI takes the same arguments."""
+    return os.environ.get("WORKER_CONTAINER_CLI") or "docker"
+
+
 def start_docker(job: dict, kind: dict, creds: marvin_api.Creds) -> None:
     if not kind.get("image"):
         raise LaunchError("this kind has no image")
     resources = kind.get("resources") or {}
     limits = [*(["--cpus", str(resources["cpu"])] if resources.get("cpu") else []), *(["--memory", str(resources["memory"])] if resources.get("memory") else [])]
     # The token goes in by NAME (-e VAR): the docker CLI reads it from its own environment, so it is not in any process listing.
-    cmd = ["docker", "run", "-d", "--name", _name(job["job"]), "--label", "marvin-worker=1", "--label", f"marvin-job={job['job']}", "-e", "MARVIN_USER_TOKEN", "-e", f"MARVIN_API_URL={creds[0]}", *limits, kind["image"], *_command(job)]
+    cmd = [container_cli(), "run", "-d", "--name", _name(job["job"]), "--label", "marvin-worker=1", "--label", f"marvin-job={job['job']}", "-e", "MARVIN_USER_TOKEN", "-e", f"MARVIN_API_URL={creds[0]}", *limits, kind["image"], *_command(job)]
     done = subprocess.run(cmd, env={**os.environ, "MARVIN_USER_TOKEN": creds[1]}, capture_output=True, text=True, timeout=120)  # noqa: S603
     if done.returncode != 0:
-        raise LaunchError(f"docker run failed: {(done.stderr or done.stdout).strip()[:300]}")
+        raise LaunchError(f"{container_cli()} run failed: {(done.stderr or done.stdout).strip()[:300]}")
 
 
 def start_http(job: dict, kind: dict, creds: marvin_api.Creds) -> None:
@@ -91,7 +96,7 @@ def job_manifest(job: dict, kind: dict, creds: marvin_api.Creds, *, secret: str)
     container = {
         "name": "worker",
         "image": kind["image"],
-        "args": _command(job)[3:],  # the image's entrypoint is `python -m marvin_worker`
+        "command": _command(job),  # the whole command: the images set CMD, not ENTRYPOINT, so `args` alone would replace it and run "run"
         "env": [
             {"name": "MARVIN_API_URL", "value": creds[0]},
             {"name": "MARVIN_USER_TOKEN", "valueFrom": {"secretKeyRef": {"name": secret, "key": "MARVIN_USER_TOKEN"}}},
@@ -130,28 +135,43 @@ def start_kubernetes(job: dict, kind: dict, creds: marvin_api.Creds, *, api: str
         raise LaunchError(f"can't reach Kubernetes: {e}") from e
 
 
+OUTPUT_MARK = "--- container output ---"
+OUTPUT_LIMIT = 4000  # characters kept per job: enough for a traceback or a run's last lines, not a whole log
+
+
 def reap_docker(creds: marvin_api.Creds) -> int:
-    """Clean up the worker containers that have exited. A job record still `claimed` or `running` when its container is gone
-    never got an outcome (the worker died, or could not start): fail it with the container's last output, so it shows at once and
-    not at the timeout. Returns how many containers it removed. Containers are kept after exit (no --rm) exactly so this can read them."""
+    """Clean up the worker containers that have exited, keeping what each one said. A job still `claimed` or `running` when its container
+    is gone never got an outcome (the worker died, or could not start): fail it with the container's last output, so it shows at once and
+    not at the timeout. A job that did report (done or failed) keeps its own log and gains the container's output after it, so a run's
+    console output is on the record instead of being thrown away with the container. Returns how many containers it removed. Containers
+    are kept after exit (no --rm) exactly so this can read them."""
 
     def docker(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=60)  # noqa: S603
+        return subprocess.run([container_cli(), *args], capture_output=True, text=True, timeout=60)  # noqa: S603
 
-    listed = docker("ps", "-a", "--filter", "label=marvin-worker=1", "--filter", "status=exited", "--format", '{{.Names}}\t{{.Label "marvin-job"}}')
+    def said(name: str, lines: int) -> str:
+        out = docker("logs", "--tail", str(lines), name)  # a container's stdout and stderr come back on the two streams
+        return (out.stdout + out.stderr).strip()
+
+    # Names from `ps`, the job's slug from `inspect`: the two tools format `ps` labels differently (Docker has .Label, Podman only the
+    # .Labels map), but `inspect` reads the same way in both.
+    listed = docker("ps", "-a", "--filter", "label=marvin-worker=1", "--filter", "status=exited", "--format", "{{.Names}}")
     if listed.returncode != 0:
         return 0
     removed = 0
-    for line in listed.stdout.splitlines():
-        name, _, slug = line.partition("\t")
-        if not name:
-            continue
+    for name in listed.stdout.split():
+        slug = docker("inspect", "-f", '{{index .Config.Labels "marvin-job"}}', name).stdout.strip()
         rows = marvin_api.query(creds, {"entries": slug}, limit=1) if slug else []
-        status = ((rows[0].get("dataJson") or {}).get("status") if rows else None)
+        data = (rows[0].get("dataJson") or {}) if rows else {}
+        status = data.get("status")
         if status in ("claimed", "running"):
             code = docker("inspect", "-f", "{{.State.ExitCode}}", name).stdout.strip()
-            tail = (docker("logs", "--tail", "15", name).stdout + docker("logs", "--tail", "15", name).stderr).strip()[-600:]
-            marvin_api.update_entry(creds, slug, {"status": "failed", "log": f"The worker container exited (code {code}) before reporting an outcome.\n{tail}"})
+            marvin_api.update_entry(creds, slug, {"status": "failed", "log": f"The worker container exited (code {code}) before reporting an outcome.\n{said(name, 15)[-600:]}"})
+        elif status in ("done", "failed") and slug and OUTPUT_MARK not in str(data.get("log") or ""):
+            output = said(name, 60)
+            if output:
+                kept = f"{str(data.get('log') or '').strip()}\n\n{OUTPUT_MARK}\n".lstrip("\n") + output[-OUTPUT_LIMIT:]
+                marvin_api.update_entry(creds, slug, {"log": kept})
         docker("rm", name)
         removed += 1
     return removed
