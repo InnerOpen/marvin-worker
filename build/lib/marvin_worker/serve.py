@@ -7,7 +7,7 @@ Marvin (a workflow's `request` step) posts a job; the worker answers 202 at once
 
 `kind` names a function registered with `@job_kind` (the kinds this image can run; see WORKER_JOB_MODULES); `job` is the slug of the Marvin record the outcome is written to
 (its `status`, a `log`, and whatever fields the job returns); `args` is the job's own input. Marvin's record is the state, so a
-restart loses nothing but a job in flight (its record stays `rendering`: post it again). Jobs run one at a time, in order.
+restart loses nothing but a job in flight (its record stays `running` until the dispatcher times it out). Jobs run one at a time, in order.
 
 Environment: WORKER_JOB_MODULES (modules that define this image's kinds), MARVIN_API_URL, MARVIN_USER_TOKEN (the `marvin` CLI's own name for it; MARVIN_TOKEN also works; a token pinned to the workspace: it can reach nothing else),
 WORKER_TOKEN (the secret Marvin sends as a Bearer token), PORT (default 8080).
@@ -27,7 +27,7 @@ from . import jobs, marvin_api
 from .jobs import Context, JobError
 
 MAX_BODY = 64 * 1024
-RUNNING, DONE, FAILED = "rendering", "done", "failed"  # the status words of the job records Marvin keeps (a record's select offers these)
+RUNNING, DONE, FAILED = "running", "done", "failed"  # the status words of Marvin's `job` records
 
 
 def validate(job: object) -> dict:
@@ -46,16 +46,23 @@ def validate(job: object) -> dict:
     return {"kind": kind, "job": record.strip(), "args": args}
 
 
-def run_job(job: dict, creds: tuple[str, str]) -> None:
-    """Do one job and write the outcome onto its record, whichever way it goes."""
+def run_job(job: dict, creds: tuple[str, str], report=None) -> bool:
+    """Do one job and report the outcome, whichever way it goes. True if it succeeded. `report(changes)` says where the status, log and
+    results go (default: onto the job's record in Marvin). The job is checked against its kind's contract first, so a bad one fails at
+    once with what is wrong and nothing runs."""
     record = job["job"]
-    marvin_api.update_entry(creds, record, {"status": RUNNING, "log": ""})
+    report = report or (lambda changes: marvin_api.update_entry(creds, record, changes))
+    report({"status": RUNNING, "log": ""})
     try:
+        jobs.check_args(job["kind"], job.get("args") or {}, creds)
         with tempfile.TemporaryDirectory(prefix="worker-") as tmp:
             result = jobs.HANDLERS[job["kind"]](job, Context(creds=creds, work=Path(tmp)))
-        marvin_api.update_entry(creds, record, {**result, "status": DONE})
+        report({**result, "status": DONE})
+        return True
     except Exception as e:  # noqa: BLE001 — whatever went wrong is the record's answer
-        marvin_api.update_entry(creds, record, {"status": FAILED, "log": f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"})
+        reason = str(e) if isinstance(e, JobError) else f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"
+        report({"status": FAILED, "log": reason})
+        return False
 
 
 def make_server(port: int, creds: tuple[str, str], worker_token: str, *, run=run_job) -> ThreadingHTTPServer:
@@ -122,3 +129,25 @@ def main() -> int:
     print(f"worker on :{server.server_port}, kinds: {', '.join(kinds)}", flush=True)
     server.serve_forever()
     return 0
+
+
+def run_once(argv: list[str]) -> int:
+    """Run ONE job and exit: for a container that exists only for the job (a Kubernetes Job, a CI runner, `docker run --rm`).
+    The job is `--kind`, `--job` (the record's slug) and `--args` (JSON), or one JSON object in WORKER_JOB. Exit 0 if it succeeded.
+    The outcome is on the record either way; the process only needs outbound access to Marvin, so nothing has to reach it."""
+    import argparse
+
+    p = argparse.ArgumentParser(prog="marvin_worker run")
+    p.add_argument("--kind")
+    p.add_argument("--job")
+    p.add_argument("--args", default="{}")
+    a = p.parse_args(argv)
+    try:
+        creds = (os.environ["MARVIN_API_URL"].rstrip("/"), os.environ.get("MARVIN_USER_TOKEN") or os.environ["MARVIN_TOKEN"])
+        jobs.load_kinds()
+        raw = json.loads(os.environ["WORKER_JOB"]) if os.environ.get("WORKER_JOB") else {"kind": a.kind, "job": a.job, "args": json.loads(a.args)}
+        job = validate(raw)
+    except (KeyError, json.JSONDecodeError, JobError) as e:
+        print(f"error: {e.args[0] if e.args else e}", flush=True)
+        return 2
+    return 0 if run_job(job, creds) else 1

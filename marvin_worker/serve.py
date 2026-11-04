@@ -46,17 +46,22 @@ def validate(job: object) -> dict:
     return {"kind": kind, "job": record.strip(), "args": args}
 
 
-def run_job(job: dict, creds: tuple[str, str]) -> bool:
-    """Do one job and write the outcome onto its record, whichever way it goes. True if it succeeded."""
+def run_job(job: dict, creds: tuple[str, str], report=None) -> bool:
+    """Do one job and report the outcome, whichever way it goes. True if it succeeded. `report(changes)` says where the status, log and
+    results go (default: onto the job's record in Marvin). The job is checked against its kind's contract first, so a bad one fails at
+    once with what is wrong and nothing runs."""
     record = job["job"]
-    marvin_api.update_entry(creds, record, {"status": RUNNING, "log": ""})
+    report = report or (lambda changes: marvin_api.update_entry(creds, record, changes))
+    report({"status": RUNNING, "log": ""})
     try:
+        jobs.check_args(job["kind"], job.get("args") or {}, creds)
         with tempfile.TemporaryDirectory(prefix="worker-") as tmp:
             result = jobs.HANDLERS[job["kind"]](job, Context(creds=creds, work=Path(tmp)))
-        marvin_api.update_entry(creds, record, {**result, "status": DONE})
+        report({**result, "status": DONE})
         return True
     except Exception as e:  # noqa: BLE001 — whatever went wrong is the record's answer
-        marvin_api.update_entry(creds, record, {"status": FAILED, "log": f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"})
+        reason = str(e) if isinstance(e, JobError) else f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"
+        report({"status": FAILED, "log": reason})
         return False
 
 

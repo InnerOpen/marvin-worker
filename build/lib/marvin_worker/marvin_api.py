@@ -39,6 +39,12 @@ def entries(creds: Creds) -> list[dict]:
     return body if isinstance(body, list) else body.get("items", [])
 
 
+def query(creds: Creds, spec: dict, *, limit: int = 100) -> list[dict]:
+    """Records matching a query spec (`{"entry_type": "job", "data": {"status": "queued"}}`): Marvin does the filtering."""
+    body = json.dumps({"spec": spec, "limit": limit}).encode()
+    return json.loads(request(creds, "/api/platform/entries/query", method="POST", data=body, content_type="application/json")).get("entries", [])
+
+
 def asset(creds: Creds, asset_id: str) -> dict:
     return json.loads(request(creds, f"/api/platform/assets/{asset_id}"))
 
@@ -61,8 +67,36 @@ def upload_asset(creds: Creds, file: Path, *, slug: str, name: str, mime: str, d
 
 def update_entry(creds: Creds, slug: str, changes: dict) -> dict:
     """Merge `changes` into the record's fields (a PATCH replaces dataJson, so the rest is read and sent back with it)."""
-    row = next((e for e in entries(creds) if e.get("slug") == slug), None)
+    row = next(iter(query(creds, {"entries": slug}, limit=1)), None)  # Marvin looks the one record up; no listing the whole workspace
     if row is None:
         raise MarvinError(f"no record “{slug}” to write to")
     data = {**(row.get("dataJson") or row.get("data") or {}), **changes}
     return json.loads(request(creds, f"/api/platform/entries/{row['id']}", method="PATCH", data=json.dumps({"dataJson": data}).encode(), content_type="application/json"))
+
+
+def upsert_entry(creds: Creds, entry_type: str, slug: str, title: str, data: dict) -> dict:
+    """Create the record if it is not there, else merge `data` into it: for a record the worker itself keeps (its heartbeat)."""
+    if query(creds, {"entries": slug}, limit=1):
+        return update_entry(creds, slug, data)
+    types = {t["slug"]: t["id"] for t in json.loads(request(creds, "/api/platform/entry-types"))}
+    if entry_type not in types:
+        raise MarvinError(f"this workspace has no “{entry_type}” entry type")
+    body = json.dumps({"entryTypeId": types[entry_type], "title": title, "slug": slug, "status": "draft", "dataJson": data}).encode()
+    return json.loads(request(creds, "/api/platform/entries", method="POST", data=body, content_type="application/json"))
+
+
+def claim(creds: Creds, slug: str, who: str, at: str, *, settle: float = 0.4) -> bool:
+    """Take a queued job for `who`: write it as claimed, wait a moment for any rival's write to land, then read it back and keep it only
+    if it is still ours. Two workers reaching for the same job end with exactly one winner, except in a narrow window at heavy load; a
+    broker would remove even that (see BACKLOG.md). False if it is not queued any more or another worker won."""
+    import time
+
+    row = next(iter(query(creds, {"entries": slug}, limit=1)), None)
+    data = (row or {}).get("dataJson") or {}
+    if row is None or data.get("status") != "queued":
+        return False
+    update_entry(creds, slug, {"status": "claimed", "claimed_by": who, "claimed_at": at, "attempts": int(data.get("attempts") or 0) + 1, "log": ""})
+    if settle:
+        time.sleep(settle)
+    again = next(iter(query(creds, {"entries": slug}, limit=1)), None)
+    return ((again or {}).get("dataJson") or {}).get("claimed_by") == who

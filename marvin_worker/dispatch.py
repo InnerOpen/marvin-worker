@@ -179,10 +179,12 @@ class Dispatcher:
         launchers: dict[str, Callable] | None = None,
         reapers: dict[str, Callable] | None = None,
         now: Callable = _now,
+        claim_settle: float = 0.4,
     ):
         self.creds, self.max_parallel, self.launchers, self.now = creds, max_parallel, launchers or LAUNCHERS, now
         self.reapers = REAPERS if reapers is None else reapers
         self.name, self.started_at, self.jobs_started, self._beat = _host(), now().isoformat(), 0, None
+        self.claim_settle = claim_settle  # seconds to wait for a rival's write before keeping a claim
 
     def _jobs(self, status: str) -> list[dict]:
         return marvin_api.query(self.creds, {"entry_type": "job", "data": {"status": status}, "sort": {"by": "created_at", "direction": "asc"}})
@@ -212,10 +214,11 @@ class Dispatcher:
             return
         self._beat = now
         modes = sorted({str(k.get("mode") or "kubernetes") for k in kinds.values()})
+        offered = [{"kind": name, "description": f"launched in {k.get('mode') or 'kubernetes'} mode"} for name, k in sorted(kinds.items())]
         try:
             marvin_api.upsert_entry(
                 self.creds, "worker", f"worker-dispatcher-{_name(self.name)[3:]}", f"Dispatcher on {self.name}",
-                {"role": "dispatcher", "host": self.name, "modes": ", ".join(modes), "last_seen": now.isoformat(), "started_at": self.started_at, "jobs_started": self.jobs_started},
+                {"role": "dispatcher", "host": self.name, "modes": ", ".join(modes), "kinds": offered, "status": "idle", "last_seen": now.isoformat(), "started_at": self.started_at, "jobs_started": self.jobs_started},
             )  # fmt: skip
         except marvin_api.MarvinError:
             pass
@@ -242,7 +245,8 @@ class Dispatcher:
             if launcher is None:
                 self._fail(row, f"Unknown mode “{kind.get('mode')}” for kind {data.get('kind')}.")
                 continue
-            marvin_api.update_entry(self.creds, row["slug"], {"status": "claimed", "claimed_at": self.now().isoformat(), "attempts": int(data.get("attempts") or 0) + 1, "log": ""})
+            if not marvin_api.claim(self.creds, row["slug"], f"dispatcher {self.name}", self.now().isoformat(), settle=self.claim_settle):
+                continue  # another worker took it
             try:
                 launcher({"kind": data["kind"], "job": row["slug"], "args": data.get("args") or {}}, kind, self.creds)
                 started += 1

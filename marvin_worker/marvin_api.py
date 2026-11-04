@@ -83,3 +83,20 @@ def upsert_entry(creds: Creds, entry_type: str, slug: str, title: str, data: dic
         raise MarvinError(f"this workspace has no “{entry_type}” entry type")
     body = json.dumps({"entryTypeId": types[entry_type], "title": title, "slug": slug, "status": "draft", "dataJson": data}).encode()
     return json.loads(request(creds, "/api/platform/entries", method="POST", data=body, content_type="application/json"))
+
+
+def claim(creds: Creds, slug: str, who: str, at: str, *, settle: float = 0.4) -> bool:
+    """Take a queued job for `who`: write it as claimed, wait a moment for any rival's write to land, then read it back and keep it only
+    if it is still ours. Two workers reaching for the same job end with exactly one winner, except in a narrow window at heavy load; a
+    broker would remove even that (see BACKLOG.md). False if it is not queued any more or another worker won."""
+    import time
+
+    row = next(iter(query(creds, {"entries": slug}, limit=1)), None)
+    data = (row or {}).get("dataJson") or {}
+    if row is None or data.get("status") != "queued":
+        return False
+    update_entry(creds, slug, {"status": "claimed", "claimed_by": who, "claimed_at": at, "attempts": int(data.get("attempts") or 0) + 1, "log": ""})
+    if settle:
+        time.sleep(settle)
+    again = next(iter(query(creds, {"entries": slug}, limit=1)), None)
+    return ((again or {}).get("dataJson") or {}).get("claimed_by") == who

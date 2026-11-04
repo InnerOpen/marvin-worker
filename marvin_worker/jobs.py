@@ -11,23 +11,99 @@ import os
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 
+from . import marvin_api
 from .marvin_api import Creds
 
 HANDLERS: dict[str, Callable] = {}
+META: dict[str, dict] = {}  # each kind's contract: what it takes, what it gives, what it needs (what a worker tells Marvin it can do)
 
 
 class JobError(ValueError):
     """A job the worker can't take, or one that can't be done: say what is wrong."""
 
 
-def job_kind(name: str) -> Callable:
+INPUT_TYPES = ("string", "number", "integer", "boolean", "object", "array", "asset")
+
+
+def _input(spec) -> dict:
+    """One declared input: a type name ("string", or "string?" for optional), or {type, required, description, enum, accepts}."""
+    if isinstance(spec, str):
+        spec = {"type": spec.rstrip("?"), "required": not spec.endswith("?")}
+    out = {"type": spec.get("type", "string"), "required": bool(spec.get("required", True))}
+    for key in ("description", "enum", "accepts"):
+        if spec.get(key):
+            out[key] = spec[key]
+    if out["type"] not in INPUT_TYPES:
+        raise ValueError(f"input type must be one of {', '.join(INPUT_TYPES)}, not {out['type']!r}")
+    return out
+
+
+def job_kind(name: str, *, description: str = "", inputs: dict | None = None, accepts: tuple | list = (), produces: tuple | list = (), needs: tuple | list = ()) -> Callable:
+    """Register a kind of job, and declare its contract so Marvin knows what it can be sent:
+    `inputs` the arguments it takes (`{"story": "string", "size": "integer?", "source": {"type": "asset", "accepts": ["audio/*"]}}`),
+    `accepts` the media types of any file it is handed (for an asset input without its own), `produces` what it gives back,
+    `needs` what the machine must have (`ffmpeg`, `gpu`). The contract is advertised in the worker's heartbeat and checked before a job runs."""
+
     def register(fn: Callable) -> Callable:
         HANDLERS[name] = fn
+        META[name] = {
+            "kind": name,
+            "description": description or ((fn.__doc__ or "").strip().splitlines() or [""])[0],
+            "inputs": {k: _input(v) for k, v in (inputs or {}).items()},
+            "accepts": list(accepts),
+            "produces": list(produces),
+            "needs": list(needs),
+        }
         return fn
 
     return register
+
+
+def describe_kinds(only: list[str] | None = None) -> list[dict]:
+    """The contracts of the kinds this worker has (all, or just `only`), in name order: what its heartbeat advertises."""
+    return [META[k] for k in sorted(HANDLERS) if k in META and (only is None or k in only)]
+
+
+def _mime_ok(mime: str, patterns: list[str]) -> bool:
+    return not patterns or any(fnmatch(mime, p) for p in patterns)
+
+
+def check_args(kind: str, args: dict, creds: Creds | None = None) -> None:
+    """Refuse a job whose arguments do not fit its kind's contract, saying every problem in plain words, before anything runs: a missing
+    argument, one of the wrong type, and (with `creds`) a file whose media type the kind does not take. Extra arguments are the kind's own business."""
+    contract = META.get(kind)
+    if not contract:
+        return
+    problems: list[str] = []
+    for key, spec in contract["inputs"].items():
+        if key not in args or args[key] in (None, ""):
+            if spec["required"]:
+                problems.append(f"“{key}” is needed" + (f" ({spec['description']})" if spec.get("description") else ""))
+            continue
+        value, kind_of = args[key], spec["type"]
+        ok = {
+            "string": isinstance(value, str), "asset": isinstance(value, str), "boolean": isinstance(value, bool), "object": isinstance(value, dict), "array": isinstance(value, list),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool), "integer": isinstance(value, int) and not isinstance(value, bool),
+        }[kind_of]  # fmt: skip
+        if not ok:
+            problems.append(f"“{key}” should be a {kind_of}")
+        elif spec.get("enum") and value not in spec["enum"]:
+            problems.append(f"“{key}” should be one of {', '.join(map(str, spec['enum']))}")
+        elif kind_of == "asset" and creds is not None:
+            patterns = spec.get("accepts") or contract["accepts"]
+            if patterns:
+                try:
+                    mime = str(marvin_api.asset(creds, value).get("mimeType") or "")
+                except marvin_api.MarvinError as e:
+                    problems.append(f"“{key}”: can't read that file ({e})")
+                    continue
+                if not _mime_ok(mime, patterns):
+                    problems.append(f"“{key}” is {mime or 'of an unknown type'}, but {kind} takes {', '.join(patterns)}")
+    if problems:
+        raise JobError(f"{kind}: " + "; ".join(problems) + ".")
 
 
 def load_kinds(modules: str | None = None) -> list[str]:
