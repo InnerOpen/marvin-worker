@@ -5,6 +5,7 @@ beyond these calls a job does with the Marvin CLI (`ctx.marvin(...)`) rather tha
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -62,13 +63,26 @@ def query(creds: Creds, spec: dict, *, limit: int = 100) -> list[dict]:
     return json.loads(request(creds, "/api/platform/entries/query", method="POST", data=body, content_type="application/json")).get("entries", [])
 
 
-def asset(creds: Creds, asset_id: str) -> dict:
-    return json.loads(request(creds, f"/api/platform/assets/{asset_id}"))
+def asset_id(creds: Creds, ref: str) -> str:
+    """The id of the asset a person named: an id is used as it is, and a slug (or the exact name) is looked up in the library, so a job
+    that takes a file can be handed whichever is to hand. Raises MarvinError when nothing, or more than one thing, has that name."""
+    try:
+        return str(json.loads(request(creds, f"/api/platform/assets/{ref}"))["id"])
+    except MarvinError:
+        rows = json.loads(request(creds, "/api/platform/assets?q=" + urllib.parse.quote(ref)))
+        hits = [r for r in rows if r.get("slug") == ref] or [r for r in rows if r.get("name") == ref]
+        if len(hits) != 1:
+            raise MarvinError(f"no single asset is called “{ref}”" if hits else f"no asset “{ref}”") from None
+        return str(hits[0]["id"])
 
 
-def download_asset(creds: Creds, asset_id: str, dest: Path) -> None:
+def asset(creds: Creds, ref: str) -> dict:
+    return json.loads(request(creds, f"/api/platform/assets/{asset_id(creds, ref)}"))
+
+
+def download_asset(creds: Creds, ref: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(request(creds, f"/api/platform/assets/{asset_id}/file"))
+    dest.write_bytes(request(creds, f"/api/platform/assets/{asset_id(creds, ref)}/file"))
 
 
 def upload_asset(creds: Creds, file: Path, *, slug: str, name: str, mime: str, description: str = "", metadata: dict | None = None) -> dict:
