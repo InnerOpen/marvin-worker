@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: marvin-worker
-Version: 0.1.0
-Summary: A generic job worker for Marvin: takes heavy jobs over HTTP, runs them, writes the outcome back to a Marvin record.
-Requires-Python: >=3.11
