@@ -64,25 +64,30 @@ def query(creds: Creds, spec: dict, *, limit: int = 100) -> list[dict]:
 
 
 def asset_id(creds: Creds, ref: str) -> str:
-    """The id of the asset a person named: an id is used as it is, and a slug (or the exact name) is looked up in the library, so a job
-    that takes a file can be handed whichever is to hand. Raises MarvinError when nothing, or more than one thing, has that name."""
+    """The id of the asset a person named by slug (or the exact name): found in the library, and refused when nothing, or more than one
+    thing, has that name. Only used when the reference was not itself an id (see `asset` and `download_asset`)."""
+    rows = json.loads(request(creds, "/api/platform/assets?q=" + urllib.parse.quote(ref)))
+    hits = [r for r in rows if r.get("slug") == ref] or [r for r in rows if r.get("name") == ref]
+    if len(hits) != 1:
+        raise MarvinError(f"no single asset is called “{ref}”" if hits else f"no asset “{ref}”")
+    return str(hits[0]["id"])
+
+
+def _by_ref(creds: Creds, ref: str, tail: str = "") -> bytes:
+    """GET an asset (or its file) by the reference given: as it is first (an id), and only if Marvin refuses it, as a slug or name."""
     try:
-        return str(json.loads(request(creds, f"/api/platform/assets/{ref}"))["id"])
+        return request(creds, f"/api/platform/assets/{ref}{tail}")
     except MarvinError:
-        rows = json.loads(request(creds, "/api/platform/assets?q=" + urllib.parse.quote(ref)))
-        hits = [r for r in rows if r.get("slug") == ref] or [r for r in rows if r.get("name") == ref]
-        if len(hits) != 1:
-            raise MarvinError(f"no single asset is called “{ref}”" if hits else f"no asset “{ref}”") from None
-        return str(hits[0]["id"])
+        return request(creds, f"/api/platform/assets/{asset_id(creds, ref)}{tail}")
 
 
 def asset(creds: Creds, ref: str) -> dict:
-    return json.loads(request(creds, f"/api/platform/assets/{asset_id(creds, ref)}"))
+    return json.loads(_by_ref(creds, ref))
 
 
 def download_asset(creds: Creds, ref: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(request(creds, f"/api/platform/assets/{asset_id(creds, ref)}/file"))
+    dest.write_bytes(_by_ref(creds, ref, "/file"))
 
 
 def upload_asset(creds: Creds, file: Path, *, slug: str, name: str, mime: str, description: str = "", metadata: dict | None = None) -> dict:
