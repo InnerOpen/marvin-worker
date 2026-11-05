@@ -16,7 +16,7 @@ import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from . import jobs
+from . import jobs, log
 from .backend import Backend, load_backend
 from .serve import run_job
 
@@ -60,6 +60,7 @@ class Runner:
             return False
         if job is None:
             return False
+        log.say(f"{job['job']}: claimed ({job['kind']}) by {self.name}")
         self.announce("busy", job["job"], force=True)
         self.run(job, self.creds, report=lambda changes: self.backend.report(job, changes))
         self.jobs_done += 1
