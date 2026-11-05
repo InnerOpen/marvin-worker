@@ -90,7 +90,7 @@ COPY mypack ./mypack
 ENV WORKER_JOB_MODULES=mypack.jobs
 ```
 
-The Storyworld media worker (ffmpeg + `audio-cut`) is the first one, in the Storyworld repo. No container platform? It is plain Python:
+[Screenplay Studio](https://github.com/iWobble/ScreenplayStudio) is the first one: its media worker (ffmpeg, rendering, transcribing) is one image built on this base. No container platform? It is plain Python:
 `WORKER_JOB_MODULES=mypack.jobs python -m marvin_worker` runs it as a process, on any machine Marvin can reach.
 
 ## Configuration
