@@ -19,11 +19,12 @@ import os
 import queue
 import tempfile
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import jobs, marvin_api
+from . import jobs, log, marvin_api
 from .jobs import Context, JobError
 
 MAX_BODY = 64 * 1024
@@ -49,19 +50,29 @@ def validate(job: object) -> dict:
 def run_job(job: dict, creds: tuple[str, str], report=None) -> bool:
     """Do one job and report the outcome, whichever way it goes. True if it succeeded. `report(changes)` says where the status, log and
     results go (default: onto the job's record in Marvin). The job is checked against its kind's contract first, so a bad one fails at
-    once with what is wrong and nothing runs."""
+    once with what is wrong and nothing runs. Each step is also a line on the worker's own log, and what the job noted while it ran goes
+    on the record's `log` (on a failure too, so it shows how far it got)."""
     record = job["job"]
     report = report or (lambda changes: marvin_api.update_entry(creds, record, changes))
+    began = time.monotonic()
+    log.say(f"{record}: started ({job['kind']})")
     report({"status": RUNNING, "log": ""})
+    ctx = None
     try:
         jobs.check_args(job["kind"], job.get("args") or {}, creds)
         with tempfile.TemporaryDirectory(prefix="worker-") as tmp:
-            result = jobs.HANDLERS[job["kind"]](job, Context(creds=creds, work=Path(tmp)))
-        report({**result, "status": DONE})
+            ctx = Context(creds=creds, work=Path(tmp), name=record)
+            result = jobs.HANDLERS[job["kind"]](job, ctx)
+        took = time.monotonic() - began
+        story = "\n".join([*ctx.notes, str(result.get("log") or "").strip()]).strip()
+        report({**result, **({"log": story} if ctx.notes else {}), "status": DONE})  # a job that noted nothing keeps its own log exactly
+        log.say(f"{record}: done in {took:.1f} s")
         return True
     except Exception as e:  # noqa: BLE001 — whatever went wrong is the record's answer
         reason = str(e) if isinstance(e, JobError) else f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"
-        report({"status": FAILED, "log": reason})
+        so_far = "\n".join(ctx.notes) + "\n" if ctx and ctx.notes else ""
+        report({"status": FAILED, "log": f"{so_far}{reason}"})
+        log.say(f"{record}: FAILED in {time.monotonic() - began:.1f} s: {reason.splitlines()[0] if reason else 'unknown'}")
         return False
 
 

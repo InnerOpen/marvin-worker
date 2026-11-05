@@ -201,3 +201,27 @@ def test_run_once_does_the_job_writes_the_record_and_exits_with_the_outcome(marv
     finally:
         del jobs.HANDLERS["boom"]
     assert _data()["status"] == "failed"
+
+
+def test_a_job_logs_its_steps_and_keeps_what_it_noted_on_the_record_even_when_it_fails(capsys):
+    @jobs.job_kind("talky")
+    def talky(job, ctx):
+        ctx.note("pulled 3 files")
+        ctx.note("mixed the audio")
+        if job["args"].get("fail"):
+            raise jobs.JobError("the audio would not mix")
+        return {"result": {"ok": True}, "log": "all done"}
+
+    try:
+        done, failed = [], []
+        assert serve.run_job({"kind": "talky", "job": "job-9", "args": {}}, ("http://x", "t"), report=done.append) is True
+        assert serve.run_job({"kind": "talky", "job": "job-10", "args": {"fail": True}}, ("http://x", "t"), report=failed.append) is False
+    finally:
+        del jobs.HANDLERS["talky"]
+
+    ok = done[-1]
+    assert ok["status"] == "done" and "pulled 3 files" in ok["log"] and "mixed the audio" in ok["log"] and "all done" in ok["log"]
+    assert failed[-1]["status"] == "failed" and "pulled 3 files" in failed[-1]["log"] and failed[-1]["log"].endswith("the audio would not mix")  # how far it got, then why it stopped
+    out = capsys.readouterr().out
+    assert "job-9: started (talky)" in out and "job-9: pulled 3 files" in out and "job-9: done in" in out
+    assert "job-10: FAILED in" in out and "the audio would not mix" in out

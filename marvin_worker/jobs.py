@@ -9,12 +9,13 @@ import importlib
 import json
 import os
 import subprocess
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 
-from . import marvin_api
+from . import log, marvin_api
 from .marvin_api import Creds
 
 HANDLERS: dict[str, Callable] = {}
@@ -118,6 +119,16 @@ def load_kinds(modules: str | None = None) -> list[str]:
 class Context:
     creds: Creds  # Marvin's address and the workspace-pinned token
     work: Path  # a scratch folder, removed when the job ends
+    name: str = ""  # the job record's slug, for the lines it logs
+    notes: list[str] = field(default_factory=list)  # what the job said it was doing, kept on the record's log
+    began: float = field(default_factory=time.monotonic)
+
+    def note(self, text: str) -> None:
+        """Say what the job is doing ("pulled 51 files"). It goes on the worker's own log at once, with the time since the job began, and
+        onto the job record's `log` when the job ends, so a failure shows how far it got."""
+        line = f"[{time.monotonic() - self.began:5.1f}s] {text}"
+        self.notes.append(line)
+        log.say(f"{self.name or 'job'}: {text}")
 
     def marvin(self, *args: str) -> object:
         """Run the Marvin CLI as the worker's pinned token (`ctx.marvin("platform", "entries", "list")`) and return its JSON."""
