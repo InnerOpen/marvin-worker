@@ -122,3 +122,7 @@ def thumbnails(job, ctx):
 record); anything else goes through the CLI.
 
 Tests: `uvx --from pytest pytest`.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
