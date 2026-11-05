@@ -489,3 +489,35 @@ def test_the_container_command_is_docker_unless_podman_is_asked_for(monkeypatch)
     assert dispatch.container_cli() == "docker"
     monkeypatch.setenv("WORKER_CONTAINER_CLI", "podman")
     assert dispatch.container_cli() == "podman"
+
+
+def test_a_worker_names_the_image_it_runs_in_its_heartbeat(monkeypatch, audio_cut, marvin):
+    from marvin_worker import jobs as jobs_module
+
+    for env, value in (("WORKER_IMAGE", "studio-worker"), ("WORKER_VERSION", "v35"), ("WORKER_REVISION", "abc1234")):
+        monkeypatch.setenv(env, value)
+    assert jobs_module.identity() == {"image": "studio-worker", "version": "v35", "revision": "abc1234"}
+    FakeMarvin.rows = []
+    r = runner.Runner(backends.MarvinBackend(marvin, settle=0), marvin, name="box-2", only=["audio-cut-t"], now=lambda: NOW)
+    r.announce(force=True)
+    beat = next(x for x in FakeMarvin.rows if x["slug"] == "worker-runner-box-2")["dataJson"]
+    assert (beat["image"], beat["version"], beat["revision"]) == ("studio-worker", "v35", "abc1234")
+
+
+def test_a_worker_that_was_told_nothing_says_nothing_about_its_image(monkeypatch):
+    from marvin_worker import jobs as jobs_module
+
+    for env in ("WORKER_IMAGE", "WORKER_VERSION", "WORKER_REVISION"):
+        monkeypatch.delenv(env, raising=False)
+    assert jobs_module.identity() == {}
+    monkeypatch.setenv("WORKER_VERSION", "  ")
+    assert jobs_module.identity() == {}  # blank is nothing
+
+
+def test_the_dispatcher_names_its_image_too(monkeypatch, marvin):
+    monkeypatch.setenv("WORKER_IMAGE", "studio-worker")
+    monkeypatch.setenv("WORKER_VERSION", "v35")
+    FakeMarvin.rows = [_kind()]
+    dispatch.Dispatcher(marvin, launchers={"local": lambda *a: None}, reapers={}, now=lambda: NOW, claim_settle=0).tick()
+    beat = next(r for r in FakeMarvin.rows if r["slug"].startswith("worker-dispatcher-"))["dataJson"]
+    assert beat["image"] == "studio-worker" and beat["version"] == "v35"

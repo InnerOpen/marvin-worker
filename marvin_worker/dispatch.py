@@ -28,7 +28,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import marvin_api
+from . import jobs, marvin_api
 
 KUBE_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 GRACE_SECONDS = 120  # past its time allowed, so a job near its limit isn't failed under the worker's feet
@@ -257,7 +257,7 @@ class Dispatcher:
         try:
             marvin_api.upsert_entry(
                 self.creds, "worker", f"worker-dispatcher-{_name(self.name)[3:]}", f"Dispatcher on {self.name}",
-                {"role": "dispatcher", "host": self.name, "modes": ", ".join(modes), "kinds": offered, "status": "idle", "last_seen": now.isoformat(), "started_at": self.started_at, "jobs_started": self.jobs_started},
+                {"role": "dispatcher", "host": self.name, "modes": ", ".join(modes), "kinds": offered, "status": "idle", "last_seen": now.isoformat(), "started_at": self.started_at, "jobs_started": self.jobs_started, **jobs.identity()},
             )  # fmt: skip
         except marvin_api.MarvinError:
             pass

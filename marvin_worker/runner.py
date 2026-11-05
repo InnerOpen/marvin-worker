@@ -37,6 +37,7 @@ class Runner:
         return {
             "role": "runner", "host": self.name, "status": status, "current_job": current or "", "kinds": self.contracts,
             "tags": ", ".join(self.tags), "last_seen": self.now().isoformat(), "started_at": self.started_at, "jobs_done": self.jobs_done,
+            **jobs.identity(),
         }  # fmt: skip
 
     def announce(self, status: str = "idle", current: str | None = None, *, force: bool = False) -> None:
