@@ -22,6 +22,13 @@ HANDLERS: dict[str, Callable] = {}
 META: dict[str, dict] = {}  # each kind's contract: what it takes, what it gives, what it needs (what a worker tells Marvin it can do)
 
 
+def identity() -> dict[str, str]:
+    """Which image this worker is running, for its heartbeat, so Marvin's Workers page can say. A container cannot see its own image name, so the
+    image bakes it in: WORKER_IMAGE (its name), WORKER_VERSION (its release) and WORKER_REVISION (the commit it was built from). Only what is set."""
+    pairs = (("image", "WORKER_IMAGE"), ("version", "WORKER_VERSION"), ("revision", "WORKER_REVISION"))
+    return {key: os.environ[env].strip() for key, env in pairs if os.environ.get(env, "").strip()}
+
+
 class JobError(ValueError):
     """A job the worker can't take, or one that can't be done: say what is wrong."""
 
