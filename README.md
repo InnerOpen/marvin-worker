@@ -16,6 +16,8 @@ A standing worker runs jobs one at a time, in the order asked. A job that fails 
 
 How to run it on Docker, Podman or Kubernetes: **[docs/deploy.md](docs/deploy.md)**.
 
+**A worker does nothing until it has a kind of job** (the base image ships none): **[docs/adding-kinds.md](docs/adding-kinds.md)** walks through writing one, loading it, running it in a process or a container, sending it a job, and what to check when it does not appear. A working example is in [`examples/hello`](examples/hello); `python -m marvin_worker kinds` shows what a worker has loaded.
+
 ## The queue: jobs are records in Marvin
 
 A task is a `job` record in Marvin (`kind`, `args`, `status`: queued → claimed → running → done / failed, plus `result` and `log`). A
@@ -107,6 +109,8 @@ nothing is written into a workflow (its `request` step reaches public hosts only
 ```
 
 ## Writing a kind of job
+
+The short version; [docs/adding-kinds.md](docs/adding-kinds.md) has the full walk-through.
 
 ```python
 from marvin_worker.jobs import job_kind

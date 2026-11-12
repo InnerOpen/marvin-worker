@@ -132,9 +132,13 @@ def main() -> int:
     except KeyError as e:
         print(f"error: {e.args[0]} is not set", flush=True)
         return 2
-    kinds = jobs.load_kinds()
+    try:
+        kinds = jobs.load_kinds()
+    except jobs.KindsError as e:
+        print(f"error: {e}", flush=True)
+        return 2
     if not kinds:
-        print("error: no job kinds: set WORKER_JOB_MODULES to the modules that define them", flush=True)
+        print(f"error: {jobs.NO_KINDS}", flush=True)
         return 2
     server = make_server(int(os.environ.get("PORT", "8080")), creds, worker_token)
     print(f"worker on :{server.server_port}, kinds: {', '.join(kinds)}", flush=True)
@@ -158,7 +162,7 @@ def run_once(argv: list[str]) -> int:
         jobs.load_kinds()
         raw = json.loads(os.environ["WORKER_JOB"]) if os.environ.get("WORKER_JOB") else {"kind": a.kind, "job": a.job, "args": json.loads(a.args)}
         job = validate(raw)
-    except (KeyError, json.JSONDecodeError, JobError) as e:
+    except (KeyError, json.JSONDecodeError, JobError, jobs.KindsError) as e:
         print(f"error: {e.args[0] if e.args else e}", flush=True)
         return 2
     return 0 if run_job(job, creds) else 1

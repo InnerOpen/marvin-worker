@@ -32,7 +32,7 @@ Where each can run:
    `worker` for something else, setup says it does not fit and leaves it alone: rename yours first.
 2. **Make a token pinned to one workspace**, so the worker can reach nothing else:
    `marvin user tokens create --name worker --pin <workspace-slug>`. Keep it in a secret store, never in an image or a Git repo.
-3. **An image**, for a container or pod. Build the base once, then a purpose image from it (see the README, "One base image, many purposes"):
+3. **A kind of job, and an image that has it.** The base image ships **no kinds of job**: a worker started from it alone stops with `this worker has no kinds of job`. Write a kind and name its module in `WORKER_JOB_MODULES` first: **[adding-kinds.md](adding-kinds.md)** does it step by step, with a working example in `examples/hello`. Then build the base once and a purpose image from it (see the README, "One base image, many purposes"):
 
    ```sh
    docker build -f docker/Dockerfile -t marvin-worker-base .       # or: podman build ...
@@ -179,5 +179,7 @@ container output capture, which is for Docker and Podman only (a Job's pod logs 
 
 ## Checking it works
 
+First, on the worker's own machine or image, run `python -m marvin_worker kinds`: it lists the kinds this worker has loaded and would offer (and says when a tool a kind needs is missing). A worker with no kinds cannot run anything. 
 Settings -> Workers shows each runner and dispatcher with its last-seen time, the kinds on offer with what each takes, gives and needs, and the queue with each
 job's whole log. A grey dot means "not running", not an error. If a job fails at once with a short message such as "story is needed", its arguments did not match the kind's contract.
+If it is not there, does not list a kind you expect, or a job stays queued, see "When it does not work" in [adding-kinds.md](adding-kinds.md).
