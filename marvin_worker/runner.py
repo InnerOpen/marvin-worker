@@ -75,10 +75,16 @@ def main() -> int:
     except KeyError as e:
         print(f"error: {e.args[0]} is not set", flush=True)
         return 2
-    kinds = jobs.load_kinds()
+    try:
+        kinds = jobs.load_kinds()
+    except jobs.KindsError as e:
+        print(f"error: {e}", flush=True)
+        return 2
     only = [k.strip() for k in os.environ.get("WORKER_KINDS", "").split(",") if k.strip()] or None
     if not jobs.describe_kinds(only):
-        print("error: no job kinds to offer: set WORKER_JOB_MODULES (and check WORKER_KINDS)", flush=True)
+        print(f"error: {jobs.NO_KINDS}", flush=True)
+        if kinds and only:
+            print(f"note: {len(kinds)} kind(s) are loaded ({', '.join(kinds)}) but WORKER_KINDS names none of them.", flush=True)
         return 2
     runner = Runner(load_backend(creds), creds, name=os.environ.get("WORKER_NAME") or socket.gethostname(), only=only)
     poll = float(os.environ.get("WORKER_POLL_SECONDS", "5"))

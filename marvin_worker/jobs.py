@@ -114,12 +114,85 @@ def check_args(kind: str, args: dict, creds: Creds | None = None) -> None:
         raise JobError(f"{kind}: " + "; ".join(problems) + ".")
 
 
+class KindsError(RuntimeError):
+    """The worker has no usable kinds of job, or a module that should define them would not load: the message says what to do about it."""
+
+
+DOCS = "docs/adding-kinds.md"
+NO_KINDS = (
+    "this worker has no kinds of job, so it has nothing to offer and nothing to run.\n"
+    "The base image (marvin-worker-base) ships none on purpose: a kind is a Python function you add.\n"
+    "  1. Write one:      @job_kind(\"hello\") in a module, e.g. mypack/jobs.py (a working one is in examples/hello)\n"
+    "  2. Name the module: WORKER_JOB_MODULES=mypack.jobs   (comma-separated for several; WORKER_KINDS, if set, must list the kind)\n"
+    "  3. Check it loaded: python -m marvin_worker kinds\n"
+    f"Step by step, for a process or a container: {DOCS}"
+)
+
+
 def load_kinds(modules: str | None = None) -> list[str]:
-    """Import the modules named (comma-separated, default WORKER_JOB_MODULES) so their `@job_kind` functions register. Returns the kinds."""
+    """Import the modules named (comma-separated, default WORKER_JOB_MODULES) so their `@job_kind` functions register. Returns the kinds.
+    A module that will not import raises `KindsError` saying which one, why, and the usual causes, not a bare traceback."""
     for name in (modules if modules is not None else os.environ.get("WORKER_JOB_MODULES", "")).split(","):
-        if name.strip():
-            importlib.import_module(name.strip())
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            importlib.import_module(name)
+        except ImportError as e:
+            raise KindsError(
+                f"WORKER_JOB_MODULES names “{name}”, which could not be imported ({type(e).__name__}: {e}).\n"
+                "Usual causes: the module is not in this image or on PYTHONPATH (COPY it in, or pip install it); the name is misspelt; "
+                "the package has no __init__.py; or the module itself imports something that is not installed."
+            ) from e
     return sorted(HANDLERS)
+
+
+def offered(only: list[str] | None = None) -> list[dict]:
+    """The contracts of the kinds this worker would offer (see `describe_kinds`), each with `missing`: the tools it needs that are not on PATH."""
+    import shutil
+
+    out = []
+    for contract in describe_kinds(only):
+        needs = [n for n in contract.get("needs") or [] if n != "gpu"]  # a gpu is not a program to look for
+        out.append({**contract, "missing": [n for n in needs if shutil.which(n) is None]})
+    return out
+
+
+def _inputs_line(contract: dict) -> str:
+    return ", ".join(f"{name} ({spec['type']}{'' if spec['required'] else ', optional'})" for name, spec in (contract.get("inputs") or {}).items()) or "nothing"
+
+
+def kinds_command() -> int:
+    """`python -m marvin_worker kinds`: what this worker has loaded and would offer, and whether the tools each needs are here. Needs no Marvin,
+    so a new kind can be checked before anything runs it. Exit 2 (with what to do) when there is nothing to offer."""
+    modules = os.environ.get("WORKER_JOB_MODULES", "").strip()
+    only = [k.strip() for k in os.environ.get("WORKER_KINDS", "").split(",") if k.strip()] or None
+    print(f"WORKER_JOB_MODULES = {modules or '(not set)'}")
+    if only:
+        print(f"WORKER_KINDS       = {', '.join(only)}  (only these are offered)")
+    try:
+        loaded = load_kinds()
+    except KindsError as e:
+        print(f"\nerror: {e}")
+        return 2
+    offer = offered(only)
+    if not offer:
+        print(f"\nerror: {NO_KINDS}")
+        if loaded and only:
+            print(f"\nnote: {len(loaded)} kind(s) are loaded ({', '.join(loaded)}) but WORKER_KINDS names none of them.")
+        return 2
+    print(f"\n{len(offer)} kind{'s' if len(offer) != 1 else ''} offered:")
+    for c in offer:
+        print(f"\n  {c['kind']}" + (f"  -  {c['description']}" if c.get("description") else ""))
+        print(f"    takes: {_inputs_line(c)}")
+        if c.get("produces"):
+            print(f"    gives: {', '.join(c['produces'])}")
+        for need in c.get("needs") or []:
+            print(f"    needs: {need}" + ("  <- NOT FOUND on this machine's PATH: install it, or jobs of this kind will fail" if need in c["missing"] else ""))
+    unfit = sorted({n for c in offer for n in c["missing"]})
+    if unfit:
+        print(f"\nwarning: not found here: {', '.join(unfit)}")
+    return 0
 
 
 @dataclass
