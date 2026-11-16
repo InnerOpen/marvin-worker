@@ -2,13 +2,20 @@
 Standard library only. Python's default user agent is refused by Marvin's edge, so every request names this tool. Anything
 beyond these calls a job does with the Marvin CLI (`ctx.marvin(...)`) rather than another client here."""
 
+import http.client
 import json
+import random
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
+
+from . import log
 
 USER_AGENT = "marvin-worker/0.1"
 PAGE = 500
@@ -18,38 +25,111 @@ class MarvinError(RuntimeError):
     pass
 
 
+class MarvinUnreachable(MarvinError):
+    """The line to Marvin failed, not the request: Marvin could not be reached (or stayed busy) through every attempt, or the connection
+    dropped after a write was sent that cannot safely be sent twice. The same job run again later can carry on."""
+
+
 Creds = tuple[str, str]  # Marvin's address and a token pinned to the workspace
 
 
-RETRY_STATUS = (429, 502, 503, 504)  # Marvin is busy or a proxy blinked: worth another go
-READ_ATTEMPTS = 4
+ATTEMPTS = 6  # the first try and five more, about 30 to 45 s of waiting in all: enough for a proxy's blink, not for an outage
+PAUSE_CAP = 20.0  # the longest wait between two tries, a Retry-After included
+TIMEOUT = 120  # seconds for each step on the socket (connecting, each read), not for the whole call: an AI run or a big upload answers slowly
+NOT_DONE = (429, 503)  # Marvin turned the call away before doing it: any call can be sent again
+ANSWER_LOST = (502, 504)  # a proxy lost Marvin's answer to a call Marvin may have done: the same as a connection that dropped
+RESENDABLE = ("GET", "HEAD", "PUT", "PATCH", "DELETE")  # sent twice, Marvin ends as if sent once (a PATCH here always sends the whole dataJson)
+READS = ("/api/platform/entries/query",)  # a POST that only reads
+
+_tell: ContextVar["Callable[[str], None] | None"] = ContextVar("marvin_api_tell", default=None)
 
 
-def request(creds: Creds, path: str, *, method: str = "GET", data: bytes | None = None, content_type: str | None = None, pause: float = 1.0) -> bytes:
-    """One call to Marvin. A read (GET) that fails on a dropped connection or a busy answer is tried again a few times, a pull downloads
-    dozens of files and one blink should not lose the job. A write is never repeated: it might already have happened."""
+@contextmanager
+def telling(say: Callable[[str], None]) -> Iterator[None]:
+    """While a job runs, each retry is a line of its own log (`ctx.note`), so the record shows the blinks it lived through."""
+    token = _tell.set(say)
+    try:
+        yield
+    finally:
+        _tell.reset(token)
+
+
+def _say(text: str) -> None:
+    (_tell.get() or log.say)(text)
+
+
+def _pause(pause: float, attempt: int, retry_after: "float | None") -> float:
+    """How long to wait before the next try: what Marvin asked for, else twice as long each time with a little jitter, so workers that lost
+    the line together do not all come back at the same moment."""
+    if retry_after is not None:
+        return min(PAUSE_CAP, retry_after)
+    return min(PAUSE_CAP, pause * 2 ** (attempt - 1) * random.uniform(1.0, 1.5))
+
+
+def _retry_after(e: urllib.error.HTTPError) -> "float | None":
+    try:
+        return max(0.0, float((e.headers or {}).get("Retry-After") or ""))
+    except (TypeError, ValueError):
+        return None  # absent, or a date: the usual pause
+
+
+def request(
+    creds: Creds,
+    path: str,
+    *,
+    method: str = "GET",
+    data: bytes | None = None,
+    content_type: str | None = None,
+    pause: float = 1.0,
+    attempts: int = ATTEMPTS,
+    done: "Callable[[], bytes | None] | None" = None,
+) -> bytes:
+    """One call to Marvin, tried again (up to `attempts` times, waiting longer each time) when what failed was the line and not the request.
+
+    Each try opens its own connection (urllib sends `Connection: close` and never reuses one), so a retry never rides a connection that died.
+    - Never sent (refused, a TLS handshake cut, the request not sent whole: urllib's URLError) or turned away (429, 503): any call is sent again.
+    - Sent, and the answer lost (the connection dropped while Marvin answered, a read timed out, a proxy's 502 or 504): only a call that is the
+      same sent twice is sent again: a read, a PATCH, a DELETE, a query. A create passes `done`, which looks after a pause for what it would
+      have made and returns Marvin's answer if it is there (it is then not sent again) or None. Any other write (an upload, an AI run) is
+      not repeated: it fails with MarvinUnreachable, saying it may have been done.
+    - Any other answer (a 4xx but 429, a 500) is the request's own and fails at once, as MarvinError.
+    The final failure is MarvinUnreachable, naming the last reason and how many tries were made."""
     base, token = creds
     headers = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT, "Accept": "*/*"}
     if content_type:
         headers["Content-Type"] = content_type
-    attempts = READ_ATTEMPTS if method == "GET" else 1
+    resendable = method in RESENDABLE or (method == "POST" and path.split("?")[0] in READS)
+    lost = False  # a try was sent and its answer never came
     for attempt in range(1, attempts + 1):
         req = urllib.request.Request(base.rstrip("/") + path, data=data, method=method, headers=headers)
+        wait = None
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
-            if e.code in RETRY_STATUS and attempt < attempts:
-                time.sleep(pause * attempt)
-                continue
-            raise MarvinError(f"Marvin answered {e.code} for {path}: {e.read()[:200].decode('utf-8', 'replace')}") from e
-        except (urllib.error.URLError, OSError) as e:  # URLError covers a refused or failed connection; OSError a reset or a dropped TLS stream mid-read
-            if attempt < attempts:
-                time.sleep(pause * attempt)
-                continue
-            reason = getattr(e, "reason", e)
-            raise MarvinError(f"can't reach Marvin ({reason})") from e
-    raise MarvinError(f"can't reach Marvin for {path}")  # not reached
+            if e.code == 404 and method == "DELETE" and lost:
+                return b""  # the try whose answer was lost did it
+            sent = e.code in ANSWER_LOST
+            if e.code not in NOT_DONE + ANSWER_LOST or (sent and not resendable and done is None):
+                raise MarvinError(f"Marvin answered {e.code} for {path}: {e.read()[:200].decode('utf-8', 'replace')}") from e
+            reason, wait = f"Marvin answered {e.code}", _retry_after(e)
+            what = "a busy answer" if e.code in NOT_DONE else f"a lost answer ({e.code})"
+        except urllib.error.URLError as e:  # urllib raises it only while connecting or sending: the request never reached Marvin whole
+            sent, reason, what = False, str(e.reason), "a failed connection"
+        except (OSError, http.client.HTTPException) as e:  # sent, then the connection dropped (or timed out) before the whole answer came
+            sent, reason, what = True, str(e) or type(e).__name__, "a dropped connection"
+            if not resendable and done is None:
+                raise MarvinUnreachable(f"can't reach Marvin ({reason}): the connection dropped after {method} {path} was sent, and it is not sent twice, as it may have been done") from e
+        lost = lost or sent
+        look = sent and done is not None  # a create whose answer was lost: did it happen?
+        if attempt < attempts or look:
+            time.sleep(_pause(pause, attempt, wait))  # before looking too: the lost try may still be landing
+        if look and (answer := done()) is not None:
+            return answer
+        if attempt == attempts:
+            raise MarvinUnreachable(f"can't reach Marvin ({reason}) after {attempts} attempts")
+        _say(f"retrying after {what} (attempt {attempt + 1} of {attempts})")
+    raise MarvinUnreachable(f"can't reach Marvin for {path}")  # not reached
 
 
 def entries(creds: Creds) -> list[dict]:
@@ -117,8 +197,28 @@ def upsert_entry(creds: Creds, entry_type: str, slug: str, title: str, data: dic
     types = {t["slug"]: t["id"] for t in json.loads(request(creds, "/api/platform/entry-types"))}
     if entry_type not in types:
         raise MarvinError(f"this workspace has no “{entry_type}” entry type")
-    body = json.dumps({"entryTypeId": types[entry_type], "title": title, "slug": slug, "status": "draft", "dataJson": data}).encode()
-    return json.loads(request(creds, "/api/platform/entries", method="POST", data=body, content_type="application/json"))
+    return create_entry(creds, types[entry_type], slug, title, data)
+
+
+def create_entry(creds: Creds, entry_type_id: str, slug: str, title: str, data: dict, *, status: str = "draft") -> dict:
+    """Make a record under the slug given, safely tried again. Marvin gives a create whose slug is taken the next free one (`slug-2`) rather
+    than refusing it, so a create sent twice would make a second record. After a lost answer the slug is looked up instead: the record
+    there is the answer, and the create is sent again only if there is none. Should the first send land after that look (a race), the
+    second record it leaves is moved to the Trash and the first is the answer."""
+    body = json.dumps({"entryTypeId": entry_type_id, "title": title, "slug": slug, "status": status, "dataJson": data}).encode()
+    looked = False
+
+    def found() -> bytes | None:
+        nonlocal looked
+        looked = True
+        row = next(iter(query(creds, {"entries": slug}, limit=1)), None)
+        return json.dumps(row).encode() if row else None
+
+    made = json.loads(request(creds, "/api/platform/entries", method="POST", data=body, content_type="application/json", done=found))
+    if looked and made.get("slug") != slug and (first := found()):
+        request(creds, f"/api/platform/entries/{made['id']}", method="DELETE")
+        return json.loads(first)
+    return made
 
 
 def claim(creds: Creds, slug: str, who: str, at: str, *, settle: float = 0.4) -> bool:

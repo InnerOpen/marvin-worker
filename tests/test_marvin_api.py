@@ -1,6 +1,11 @@
-"""The worker's one call to Marvin (marvin_api.request): a read is tried again after a blink, a write never is."""
+"""The worker's one call to Marvin (marvin_api.request): what failed on the line is tried again, what the request itself got wrong is not,
+and a write that may already have happened is never done twice."""
 
+import http.client
 import io
+import json
+import socket
+import threading
 import urllib.error
 
 import pytest
@@ -38,34 +43,149 @@ def _urlopen(monkeypatch, outcomes):
     return calls
 
 
+def _http_error(code, body=b"", headers=None):
+    return urllib.error.HTTPError("u", code, "x", headers or {}, io.BytesIO(body))
+
+
+NEVER_SENT = urllib.error.URLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1010)")  # the handshake was cut
+DROPPED = http.client.RemoteDisconnected("Remote end closed connection without response")  # sent, and no answer came
+
+
 def test_a_read_that_loses_its_connection_is_tried_again_and_then_works(monkeypatch):
-    calls = _urlopen(monkeypatch, [urllib.error.URLError("EOF occurred in violation of protocol"), ConnectionResetError("reset"), b"ok"])
-    assert marvin_api.request(CREDS, "/a", pause=0) == b"ok" and len(calls) == 3
+    calls = _urlopen(monkeypatch, [NEVER_SENT, ConnectionResetError("reset"), DROPPED, b"ok"])
+    assert marvin_api.request(CREDS, "/a", pause=0) == b"ok" and len(calls) == 4
 
 
 def test_a_busy_answer_is_tried_again_but_a_real_refusal_is_not(monkeypatch):
-    busy = urllib.error.HTTPError("u", 503, "busy", {}, io.BytesIO(b"later"))
-    calls = _urlopen(monkeypatch, [busy, b"ok"])
-    assert marvin_api.request(CREDS, "/a", pause=0) == b"ok" and len(calls) == 2
-    denied = urllib.error.HTTPError("u", 403, "no", {}, io.BytesIO(b"no"))
-    calls = _urlopen(monkeypatch, [denied])
-    with pytest.raises(marvin_api.MarvinError, match="403") and pytest.raises(marvin_api.MarvinError):
+    calls = _urlopen(monkeypatch, [_http_error(503, b"later"), _http_error(429), b"ok"])
+    assert marvin_api.request(CREDS, "/a", method="POST", data=b"{}", pause=0) == b"ok" and len(calls) == 3  # turned away before it was done: any call
+    for code in (400, 403, 404, 409, 422, 500):
+        calls = _urlopen(monkeypatch, [_http_error(code, b"no")])
+        with pytest.raises(marvin_api.MarvinError, match=str(code)) as e:
+            marvin_api.request(CREDS, "/a", pause=0)
+        assert len(calls) == 1 and not isinstance(e.value, marvin_api.MarvinUnreachable)
+
+
+def test_a_retry_after_is_waited_for_and_otherwise_each_wait_is_longer(monkeypatch):
+    waits = []
+    monkeypatch.setattr(marvin_api.time, "sleep", waits.append)
+    _urlopen(monkeypatch, [_http_error(429, headers={"Retry-After": "7"}), _http_error(429, headers={"Retry-After": "600"}), b"ok"])
+    assert marvin_api.request(CREDS, "/a") == b"ok" and waits == [7.0, marvin_api.PAUSE_CAP]  # a long ask is cut to the cap
+    first, third, fifth = (marvin_api._pause(1.0, n, None) for n in (1, 3, 5))
+    assert 1 <= first <= 1.5 and 4 <= third <= 6 and 16 <= fifth <= marvin_api.PAUSE_CAP
+
+
+def test_it_gives_up_after_every_attempt_and_says_why_and_how_many(monkeypatch):
+    calls = _urlopen(monkeypatch, [DROPPED, DROPPED, NEVER_SENT])
+    with pytest.raises(marvin_api.MarvinUnreachable, match=r"can't reach Marvin \(\[SSL: UNEXPECTED_EOF.*\) after 6 attempts") as e:
         marvin_api.request(CREDS, "/a", pause=0)
-    assert len(calls) == 1
+    assert isinstance(e.value, marvin_api.MarvinError) and len(calls) == marvin_api.ATTEMPTS == 6  # callers that catch MarvinError still do
 
 
-def test_it_gives_up_after_a_few_goes_and_says_it_cannot_reach_marvin(monkeypatch):
-    calls = _urlopen(monkeypatch, [urllib.error.URLError("down")])
-    with pytest.raises(marvin_api.MarvinError, match="can't reach Marvin"):
-        marvin_api.request(CREDS, "/a", pause=0)
-    assert len(calls) == marvin_api.READ_ATTEMPTS
+def test_a_write_that_never_reached_marvin_is_sent_again(monkeypatch):
+    calls = _urlopen(monkeypatch, [NEVER_SENT, NEVER_SENT, b'{"id": "1"}'])
+    assert marvin_api.request(CREDS, "/api/platform/assets/upload", method="POST", data=b"x", pause=0) == b'{"id": "1"}' and calls == ["POST"] * 3
 
 
-def test_a_write_is_never_repeated(monkeypatch):
-    calls = _urlopen(monkeypatch, [urllib.error.URLError("dropped")])
-    with pytest.raises(marvin_api.MarvinError):
-        marvin_api.request(CREDS, "/a", method="POST", data=b"{}", pause=0)
+def test_a_write_whose_answer_was_lost_is_not_sent_twice_unless_it_is_the_same_sent_twice(monkeypatch):
+    calls = _urlopen(monkeypatch, [DROPPED, b"{}"])
+    with pytest.raises(marvin_api.MarvinUnreachable, match="may have been done"):
+        marvin_api.request(CREDS, "/api/ai/agents/chat/run", method="POST", data=b"{}", pause=0)
     assert calls == ["POST"]
+    calls = _urlopen(monkeypatch, [_http_error(502, b"bad gateway"), b"{}"])  # a proxy lost the answer: the same
+    with pytest.raises(marvin_api.MarvinError, match="502"):
+        marvin_api.request(CREDS, "/api/platform/assets/upload", method="POST", data=b"{}", pause=0)
+    assert calls == ["POST"]
+    for method, path in (("PATCH", "/api/platform/entries/1"), ("DELETE", "/api/platform/entries/1"), ("POST", "/api/platform/entries/query")):
+        calls = _urlopen(monkeypatch, [DROPPED, TimeoutError("timed out"), _http_error(504), b"{}"])
+        assert marvin_api.request(CREDS, path, method=method, data=b"{}", pause=0) == b"{}" and calls == [method] * 4
+
+
+def test_a_delete_whose_lost_answer_was_done_is_not_an_error_the_second_time(monkeypatch):
+    _urlopen(monkeypatch, [DROPPED, _http_error(404, b"gone")])
+    assert marvin_api.request(CREDS, "/api/platform/assets/a1", method="DELETE", pause=0) == b""
+    _urlopen(monkeypatch, [_http_error(404, b"gone")])
+    with pytest.raises(marvin_api.MarvinError, match="404"):  # but a first answer of 404 is a real one
+        marvin_api.request(CREDS, "/api/platform/assets/a1", method="DELETE", pause=0)
+
+
+def _creating(monkeypatch, posts, there):
+    """POST /entries answers from `posts` in turn; a look by slug finds `there()` (a row or None)."""
+    seen = []
+
+    def fake(req, timeout=0):
+        path = req.full_url.split("://", 1)[1].split("/", 1)[1]
+        seen.append(f"{req.get_method()} {path}")
+        if path == "api/platform/entries/query":
+            row = there()
+            return _Reply(json.dumps({"entries": [row] if row else []}).encode())
+        if req.get_method() == "DELETE":
+            return _Reply(b"{}")
+        outcome = posts.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return _Reply(json.dumps(outcome).encode())
+
+    monkeypatch.setattr(marvin_api.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(marvin_api.time, "sleep", lambda s: None)
+    return seen
+
+
+def test_a_create_whose_answer_was_lost_is_found_by_its_slug_and_not_made_twice(monkeypatch):
+    row = {"id": "e1", "slug": "s-beat-1001", "title": "Beat"}
+    seen = _creating(monkeypatch, [DROPPED], lambda: row)  # it landed: Marvin made it, then the answer was lost
+    assert marvin_api.create_entry(CREDS, "T", "s-beat-1001", "Beat", {}) == row
+    assert seen == ["POST api/platform/entries", "POST api/platform/entries/query"]
+
+
+def test_a_create_that_did_not_land_is_sent_again(monkeypatch):
+    made = {"id": "e1", "slug": "s-beat-1001"}
+    seen = _creating(monkeypatch, [DROPPED, made], lambda: None)
+    assert marvin_api.create_entry(CREDS, "T", "s-beat-1001", "Beat", {}) == made
+    assert seen == ["POST api/platform/entries", "POST api/platform/entries/query", "POST api/platform/entries"]
+
+
+def test_a_create_whose_first_send_landed_late_keeps_one_record(monkeypatch):
+    first, extra = {"id": "e1", "slug": "s-beat-1001"}, {"id": "e2", "slug": "s-beat-1001-2"}  # Marvin gives a taken slug the next free one
+    looks = iter([None, first])  # not there when looked for, there once the second send had made its own
+    seen = _creating(monkeypatch, [DROPPED, extra], lambda: next(looks))
+    assert marvin_api.create_entry(CREDS, "T", "s-beat-1001", "Beat", {}) == first
+    assert seen[-1] == "DELETE api/platform/entries/e2"
+
+
+def test_each_retry_is_a_line_of_the_jobs_own_log(monkeypatch, capsys):
+    _urlopen(monkeypatch, [DROPPED, NEVER_SENT, b"ok"])
+    said = []
+    with marvin_api.telling(said.append):
+        marvin_api.request(CREDS, "/a", pause=0)
+    assert said == ["retrying after a dropped connection (attempt 2 of 6)", "retrying after a failed connection (attempt 3 of 6)"]
+    _urlopen(monkeypatch, [DROPPED, b"ok"])
+    marvin_api.request(CREDS, "/a", pause=0)  # no job: the worker's own log
+    assert "retrying after a dropped connection (attempt 2 of 6)" in capsys.readouterr().out
+
+
+def test_a_real_server_that_drops_the_connection_twice_is_reached_on_the_third_try():
+    """No fake opener: a socket that reads the request and hangs up, as a proxy cutting a connection does, then answers. Each try is a
+    connection of its own."""
+    server = socket.create_server(("127.0.0.1", 0))
+    connections = []
+
+    def serve():
+        for n in range(3):
+            conn, _ = server.accept()
+            connections.append(n)
+            conn.recv(65536)
+            if n == 2:
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    base = f"http://127.0.0.1:{server.getsockname()[1]}"
+    try:
+        assert marvin_api.request((base, "tok"), "/api/platform/entries/e1", method="PATCH", data=b"{}", pause=0) == b"ok"
+        assert connections == [0, 1, 2]
+    finally:
+        server.close()
 
 
 def _routes(monkeypatch, table):
