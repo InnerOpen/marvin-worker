@@ -62,7 +62,8 @@ def run_job(job: dict, creds: tuple[str, str], report=None) -> bool:
         jobs.check_args(job["kind"], job.get("args") or {}, creds)
         with tempfile.TemporaryDirectory(prefix="worker-") as tmp:
             ctx = Context(creds=creds, work=Path(tmp), name=record)
-            result = jobs.HANDLERS[job["kind"]](job, ctx)
+            with marvin_api.telling(ctx.note):  # a call to Marvin tried again is a line of the job's own log
+                result = jobs.HANDLERS[job["kind"]](job, ctx)
         took = time.monotonic() - began
         story = "\n".join([*ctx.notes, str(result.get("log") or "").strip()]).strip()
         report({**result, **({"log": story} if ctx.notes else {}), "status": DONE})  # a job that noted nothing keeps its own log exactly
