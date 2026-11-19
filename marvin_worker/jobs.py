@@ -56,6 +56,11 @@ def job_kind(name: str, *, description: str = "", inputs: dict | None = None, ac
     `needs` what the machine must have (`ffmpeg`, `gpu`). The contract is advertised in the worker's heartbeat and checked before a job runs."""
 
     def register(fn: Callable) -> Callable:
+        if (had := HANDLERS.get(name)) is not None and _where(had) != _where(fn):  # the same function again (a module reloaded) is fine
+            raise KindsError(
+                f"two functions claim the kind of job “{name}”: {_where(had)} and {_where(fn)}. A kind's name must be unique across "
+                "every module in WORKER_JOB_MODULES, or one would silently take the other's jobs: rename one (a prefix such as your package's name helps)."
+            )
         HANDLERS[name] = fn
         META[name] = {
             "kind": name,
@@ -68,6 +73,10 @@ def job_kind(name: str, *, description: str = "", inputs: dict | None = None, ac
         return fn
 
     return register
+
+
+def _where(fn: Callable) -> str:
+    return f"{getattr(fn, '__module__', '?')}.{getattr(fn, '__qualname__', repr(fn))}"
 
 
 def describe_kinds(only: list[str] | None = None) -> list[dict]:

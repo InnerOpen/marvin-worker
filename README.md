@@ -125,6 +125,26 @@ def thumbnails(job, ctx):
 `marvin_worker.marvin_api` has the few calls the worker makes itself (read records, download and upload an asset, merge fields into a
 record); anything else goes through the CLI.
 
+### A worker's files are marked as a worker's
+
+Every file a job uploads with `marvin_api.upload_asset` carries, in its metadata, which kind of job made it and the job's record:
+
+```json
+{"worker": {"kind": "render", "job": "job-render-the-last-onion"}}
+```
+
+The worker adds it around every job (runner, standing worker and `run`), so a kind never has to. It is merged with the metadata the job
+passes: the job's own keys (`kind`, `derived_from`, anything else) are kept as given, and a `worker` key the job sets itself wins. Outside a
+job (a script calling `upload_asset` directly) nothing is added.
+
+It is there so a workflow on `asset_uploaded` can tell a file a person uploaded from one a worker made: a condition
+`asset.metadata.worker exists false` keeps a "describe every new recording" workflow from running on the worker's own posters, converted
+audio and transcripts, and so from looping. A job that uploads from threads it starts itself should run them with
+`contextvars.copy_context().run(...)`, or files uploaded from those threads go unmarked.
+
+A kind's name is unique: two functions registering the same name (in one module or in two named by `WORKER_JOB_MODULES`) stop the worker at
+start with an error naming both, rather than one silently taking the other's jobs.
+
 Tests: `uvx --from pytest pytest`.
 
 ## Licence

@@ -54,6 +54,29 @@ def telling(say: Callable[[str], None]) -> Iterator[None]:
         _tell.reset(token)
 
 
+_job: ContextVar["dict[str, str] | None"] = ContextVar("marvin_api_job", default=None)
+
+
+@contextmanager
+def working(kind: str, job: str) -> Iterator[None]:
+    """While a job runs, every file it uploads is stamped `metadata.worker = {kind, job}` (see `upload_asset`), so a workflow can tell a
+    worker's file from one a person uploaded. The worker sets this around each job; a job never has to. A ContextVar, so each thread (and
+    so each job) sees only its own, and nothing is left behind when the job ends, however it ends."""
+    token = _job.set({"kind": kind, "job": job})
+    try:
+        yield
+    finally:
+        _job.reset(token)
+
+
+def stamped(metadata: dict | None) -> dict:
+    """The metadata an upload sends: the caller's, untouched, plus `worker` when a job is running and the caller did not set one."""
+    meta = dict(metadata or {})
+    if (who := _job.get()) is not None:
+        meta.setdefault("worker", dict(who))
+    return meta
+
+
 def _say(text: str) -> None:
     (_tell.get() or log.say)(text)
 
@@ -172,9 +195,9 @@ def download_asset(creds: Creds, ref: str, dest: Path) -> None:
 
 def upload_asset(creds: Creds, file: Path, *, slug: str, name: str, mime: str, description: str = "", metadata: dict | None = None) -> dict:
     """Upload a file as a new asset (multipart, like the Assets page). The file keeps its name, because Marvin reads a file's type
-    from its extension."""
+    from its extension. Inside a job the metadata also carries `worker: {kind, job}` (see `working`); the caller's own keys are kept as given."""
     boundary = uuid.uuid4().hex
-    fields = {"slug": slug, "name": name, "description": description, "metadata": json.dumps(metadata or {})}
+    fields = {"slug": slug, "name": name, "description": description, "metadata": json.dumps(stamped(metadata))}
     parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields.items() if v != ""]
     head = f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{file.name}"\r\nContent-Type: {mime}\r\n\r\n'.encode()
     body = b"".join(parts) + head + file.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
