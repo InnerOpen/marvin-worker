@@ -225,3 +225,91 @@ def test_a_job_logs_its_steps_and_keeps_what_it_noted_on_the_record_even_when_it
     out = capsys.readouterr().out
     assert "job-9: started (talky)" in out and "job-9: pulled 3 files" in out and "job-9: done in" in out
     assert "job-10: FAILED in" in out and "the audio would not mix" in out
+
+
+def _sent_metadata(body: bytes) -> dict:
+    """The `metadata` form field of a multipart upload, as the JSON Marvin reads."""
+    head = b'name="metadata"\r\n\r\n'
+    start = body.index(head) + len(head)
+    return json.loads(body[start : body.index(b"\r\n", start)])
+
+
+def _upload(creds, tmp_path, slug, metadata=None):
+    file = tmp_path / f"{slug}.mp3"
+    file.write_bytes(b"ID3")
+    return marvin_api.upload_asset(creds, file, slug=slug, name=slug, mime="audio/mpeg", metadata=metadata)
+
+
+def test_a_file_a_job_uploads_says_which_kind_and_job_made_it_and_keeps_the_callers_own_metadata(marvin, tmp_path):
+    given = {"kind": "subtitles", "derived_from": "asset-src", "story": "the-last-onion"}
+
+    @jobs.job_kind("stamp-t")
+    def stamp(job, ctx):
+        _upload(ctx.creds, tmp_path, "plain")  # no metadata at all: called as Studio's jobs call it
+        _upload(ctx.creds, tmp_path, "given", given)
+        _upload(ctx.creds, tmp_path, "own", {"worker": {"note": "the caller's own"}})
+        return {}
+
+    try:
+        assert serve.run_job({"kind": "stamp-t", "job": "job-1", "args": {}}, marvin) is True
+    finally:
+        del jobs.HANDLERS["stamp-t"]
+
+    plain, with_given, own = (_sent_metadata(body) for _, body in FakeMarvin.uploads)
+    assert plain == {"worker": {"kind": "stamp-t", "job": "job-1"}}
+    assert with_given == {**given, "worker": {"kind": "stamp-t", "job": "job-1"}}  # `kind` and `derived_from` kept as given
+    assert own == {"worker": {"note": "the caller's own"}}  # a caller's key is never overwritten
+    assert given == {"kind": "subtitles", "derived_from": "asset-src", "story": "the-last-onion"}  # nor is the caller's dict changed
+
+
+def test_a_file_uploaded_outside_a_job_has_no_stamp_even_after_a_job_that_failed(marvin, tmp_path):
+    @jobs.job_kind("fails-t")
+    def fails(job, ctx):
+        _upload(ctx.creds, tmp_path, "inside")
+        raise jobs.JobError("stopped half way")
+
+    _upload(marvin, tmp_path, "before", {"seconds": 3})
+    try:
+        assert serve.run_job({"kind": "fails-t", "job": "job-1", "args": {}}, marvin) is False
+    finally:
+        del jobs.HANDLERS["fails-t"]
+    _upload(marvin, tmp_path, "after")
+
+    before, inside, after = (_sent_metadata(body) for _, body in FakeMarvin.uploads)
+    assert before == {"seconds": 3} and after == {}  # exactly what the caller gave
+    assert inside == {"worker": {"kind": "fails-t", "job": "job-1"}}
+
+
+def test_jobs_running_at_once_on_two_threads_each_stamp_their_own_files(marvin, tmp_path):
+    both_in = threading.Barrier(2, timeout=5)
+    FakeMarvin.entries = [{"id": f"e{n}", "slug": f"job-{n}", "dataJson": {"status": "queued"}} for n in (1, 2)]
+
+    def make(name):
+        @jobs.job_kind(name)
+        def interleave(job, ctx):
+            both_in.wait()  # both jobs are now running at the same moment
+            _upload(ctx.creds, tmp_path, f"{job['job']}-a")
+            both_in.wait()
+            _upload(ctx.creds, tmp_path, f"{job['job']}-b")
+            return {}
+
+    make("left-t"), make("right-t")
+    ok = []
+    try:
+        runs = [threading.Thread(target=lambda k=k, j=j: ok.append(serve.run_job({"kind": k, "job": j, "args": {}}, marvin))) for k, j in (("left-t", "job-1"), ("right-t", "job-2"))]
+        for t in runs:
+            t.start()
+        for t in runs:
+            t.join(10)
+    finally:
+        del jobs.HANDLERS["left-t"], jobs.HANDLERS["right-t"]
+
+    assert ok == [True, True]
+    stamps = {}
+    for _, body in FakeMarvin.uploads:
+        slug = body.split(b'name="slug"\r\n\r\n', 1)[1].split(b"\r\n", 1)[0].decode()
+        stamps[slug] = _sent_metadata(body)["worker"]
+    assert stamps == {
+        "job-1-a": {"kind": "left-t", "job": "job-1"}, "job-1-b": {"kind": "left-t", "job": "job-1"},
+        "job-2-a": {"kind": "right-t", "job": "job-2"}, "job-2-b": {"kind": "right-t", "job": "job-2"},
+    }  # fmt: skip

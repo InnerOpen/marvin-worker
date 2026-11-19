@@ -121,7 +121,7 @@ The runner claims it (`claimed` -> `running`), runs `hello`, and the record ends
 
 ## 5. Adding another kind later
 
-1. Add a function with `@job_kind("name", ...)` to a module that is already in `WORKER_JOB_MODULES`, or add a new module to that list (comma-separated: `WORKER_JOB_MODULES=hello_pack.jobs,hello_pack.more`).
+1. Add a function with `@job_kind("name", ...)` (a name no other loaded kind has) to a module that is already in `WORKER_JOB_MODULES`, or add a new module to that list (comma-separated: `WORKER_JOB_MODULES=hello_pack.jobs,hello_pack.more`).
 2. Run `python -m marvin_worker kinds` and read what it lists.
 3. **Restart the runner, or rebuild the image and recreate the container.** Kinds are read once, at start; a running worker never notices a new function or a changed contract. This is the usual reason a new kind "isn't there".
 4. Its contract shows on Settings -> Workers within a minute.
@@ -136,6 +136,7 @@ If you use a **dispatcher** (a container per job) instead of a runner, each kind
 |---|---|
 | `error: this worker has no kinds of job` | No module defines one, or `WORKER_JOB_MODULES` is not set where the worker runs (a container does not see your shell's variables: put `ENV` in the Dockerfile or `-e` on `docker run`). The base image has none. Run `python -m marvin_worker kinds` in the same environment. |
 | `WORKER_JOB_MODULES names “x”, which could not be imported` | The module is not in the image or on `PYTHONPATH` (`COPY` it, and check the folder has an `__init__.py`), the name is misspelt, or the module imports something that is not installed. |
+| `two functions claim the kind of job “x”` | Two `@job_kind("x")` functions are loaded: in one module, or in two named by `WORKER_JOB_MODULES` (two packs in one image). Rename one; a prefix of your package's name avoids it. |
 | `WORKER_KINDS names none of them` | `WORKER_KINDS` lists kinds that are not the loaded ones: check the spelling, or unset it. |
 | The runner is on Settings -> Workers but lists no kinds | It was started before the kinds were added: restart it (or rebuild the image). Also give it a minute. |
 | It is not on Settings -> Workers at all | The URL or token is wrong; the token is pinned to another workspace; the workspace has no `worker` record type (`marvin platform workers setup`); or the runner is not running (`docker logs`). |

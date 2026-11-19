@@ -1,5 +1,6 @@
 """A worker with no kinds, or a pack that will not load, says what to do; `kinds` shows what is loaded; the example pack works."""
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -20,7 +21,7 @@ def clean_registry(monkeypatch):
     before = set(sys.modules)
     yield
     for name in set(sys.modules) - before:
-        if name.startswith(("hello_pack", "broken_pack")):
+        if name.startswith(("hello_pack", "broken_pack", "clash_")):
             del sys.modules[name]
 
 
@@ -79,3 +80,52 @@ def test_a_runner_and_a_standing_worker_with_no_kinds_stop_with_the_same_guidanc
     assert serve.main() == 2 and "docs/adding-kinds.md" in capsys.readouterr().out
     monkeypatch.setenv("WORKER_JOB_MODULES", "no_such_pack.jobs")
     assert runner.main() == 2 and "could not be imported" in capsys.readouterr().out
+
+
+def _pack(root: Path, name: str, kind: str) -> None:
+    (root / name).mkdir()
+    (root / name / "__init__.py").write_text("")
+    (root / name / "jobs.py").write_text(f'from marvin_worker.jobs import job_kind\n\n@job_kind("{kind}")\ndef run(job, ctx):\n    return {{}}\n')
+
+
+def test_two_modules_claiming_one_kind_stop_the_worker_naming_both_instead_of_the_last_one_winning(monkeypatch, capsys, tmp_path):
+    _pack(tmp_path, "clash_a", "describe")
+    _pack(tmp_path, "clash_b", "describe")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("WORKER_JOB_MODULES", "clash_a.jobs,clash_b.jobs")
+
+    with pytest.raises(jobs.KindsError) as e:
+        jobs.load_kinds()
+    said = str(e.value)
+    assert "“describe”" in said and "clash_a.jobs.run" in said and "clash_b.jobs.run" in said and "WORKER_JOB_MODULES" in said
+    assert jobs.HANDLERS["describe"].__module__ == "clash_a.jobs"  # the first keeps its jobs: nothing was silently replaced
+
+    sys.modules.pop("clash_b.jobs", None)
+    assert jobs.kinds_command() == 2 and "two functions claim the kind of job “describe”" in capsys.readouterr().out
+    for var, value in (("MARVIN_API_URL", "http://m"), ("MARVIN_USER_TOKEN", "tok"), ("WORKER_TOKEN", "w")):
+        monkeypatch.setenv(var, value)
+    sys.modules.pop("clash_b.jobs", None)
+    assert runner.main() == 2 and "two functions claim" in capsys.readouterr().out
+
+
+def test_the_same_module_loaded_again_registers_its_kinds_again_without_a_clash(monkeypatch, tmp_path):
+    _pack(tmp_path, "clash_same", "describe")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    assert jobs.load_kinds("clash_same.jobs") == ["describe"]
+    assert jobs.load_kinds("clash_same.jobs") == ["describe"]  # already imported: nothing runs twice
+    importlib.reload(sys.modules["clash_same.jobs"])  # a reload re-runs the decorator for the same function: still fine
+    assert jobs.HANDLERS["describe"] is sys.modules["clash_same.jobs"].run
+
+
+def test_a_kind_registered_in_code_twice_is_refused_too():
+    @jobs.job_kind("twice")
+    def first(job, ctx):
+        return {}
+
+    with pytest.raises(jobs.KindsError, match="“twice”"):
+
+        @jobs.job_kind("twice")
+        def second(job, ctx):
+            return {}
+
+    assert jobs.HANDLERS["twice"] is first
