@@ -222,3 +222,24 @@ def test_a_name_that_matches_nothing_or_two_assets_is_refused_with_the_name(monk
         marvin_api.asset(CREDS, "none")
     with pytest.raises(marvin_api.MarvinError, match="no single asset is called “dup”"):
         marvin_api.asset(CREDS, "dup")
+
+
+def test_entries_reads_every_page_and_keeps_an_entry_that_comes_round_twice_once(monkeypatch):
+    monkeypatch.setattr(marvin_api, "PAGE", 2)
+    pages = {0: [{"id": "c"}, {"id": "b"}], 2: [{"id": "b"}, {"id": "a"}], 4: [{"id": "z"}]}  # b: something was made between two pages
+    asked = []
+
+    def fake(creds, path, **_):
+        asked.append(path)
+        return json.dumps(pages[int(path.rsplit("offset=", 1)[1])]).encode()
+
+    monkeypatch.setattr(marvin_api, "request", fake)
+    assert [row["id"] for row in marvin_api.entries(("http://m", "tok"))] == ["c", "b", "a", "z"]
+    assert asked == [f"/api/platform/entries?limit=2&offset={n}" for n in (0, 2, 4)]
+
+
+def test_entries_stops_at_a_short_first_page(monkeypatch):
+    asked = []
+    monkeypatch.setattr(marvin_api, "request", lambda creds, path, **_: asked.append(path) or b'{"items": [{"id": "only"}]}')
+    assert marvin_api.entries(("http://m", "tok")) == [{"id": "only"}]
+    assert len(asked) == 1
