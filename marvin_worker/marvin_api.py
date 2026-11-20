@@ -156,8 +156,17 @@ def request(
 
 
 def entries(creds: Creds) -> list[dict]:
-    body = json.loads(request(creds, f"/api/platform/entries?limit={PAGE}"))
-    return body if isinstance(body, list) else body.get("items", [])
+    """Every entry in the workspace, read a page at a time: one page alone loses a workspace's older entries once it holds more than PAGE.
+    Marvin lists the newest first, so an entry made between two pages comes round again: each is kept once."""
+    rows: dict[str, dict] = {}
+    seen = 0
+    while True:
+        body = json.loads(request(creds, f"/api/platform/entries?limit={PAGE}&offset={seen}"))
+        page = body if isinstance(body, list) else body.get("items", [])
+        rows.update((str(row.get("id")), row) for row in page)
+        seen += len(page)
+        if len(page) < PAGE:
+            return list(rows.values())
 
 
 def query(creds: Creds, spec: dict, *, limit: int = 100) -> list[dict]:
