@@ -243,3 +243,9 @@ def test_entries_stops_at_a_short_first_page(monkeypatch):
     monkeypatch.setattr(marvin_api, "request", lambda creds, path, **_: asked.append(path) or b'{"items": [{"id": "only"}]}')
     assert marvin_api.entries(("http://m", "tok")) == [{"id": "only"}]
     assert len(asked) == 1
+
+
+def test_entries_keeps_every_row_that_has_no_id(monkeypatch):
+    """Two rows without an id are two rows: only an id says that a row is one seen before."""
+    monkeypatch.setattr(marvin_api, "request", lambda creds, path, **_: b'[{"slug": "a"}, {"slug": "b"}, {"id": "1"}, {"id": "1"}]')
+    assert marvin_api.entries(("http://m", "tok")) == [{"slug": "a"}, {"slug": "b"}, {"id": "1"}]
